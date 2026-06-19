@@ -1,0 +1,20 @@
+# Audio capture (Windows WASAPI loopback)
+PyAudioWPatch==0.2.12.7
+
+# Speech-to-text (runs on GPU via CUDA, falls back to CPU)
+faster-whisper==1.1.1
+
+# Voice activity detection for endpointing (detect when speaker stops)
+webrtcvad-wheels==2.0.14
+
+# AI brain - Google Gemini
+google-genai==1.21.0
+
+# Floating overlay UI
+PySide6==6.9.1
+
+# Audio array handling
+numpy==2.2.6
+
+# Load secrets from .env
+python-dotenv==1.1.0

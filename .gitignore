@@ -1,0 +1,23 @@
+# Secrets - never commit
+.env
+
+# Personal meeting briefing (user-specific runtime data)
+context.txt
+
+# Python virtual environment
+.venv/
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Whisper model cache (downloaded models, large)
+models/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
