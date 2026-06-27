@@ -13,12 +13,45 @@ import pyaudiowpatch as pyaudio
 from src.config import SAMPLE_RATE
 
 
+def list_loopback_devices() -> list[dict]:
+    """List the available WASAPI loopback devices.
+
+    Each entry is {"index", "name", "is_default"} where "is_default" marks the
+    loopback of the current default speakers. Used to populate the UI selector.
+    """
+    pa = pyaudio.PyAudio()
+    try:
+        wasapi = pa.get_host_api_info_by_type(pyaudio.paWASAPI)
+        default_out = pa.get_device_info_by_index(wasapi["defaultOutputDevice"])
+        default_name = default_out["name"]
+
+        devices: list[dict] = []
+        for loopback in pa.get_loopback_device_info_generator():
+            devices.append(
+                {
+                    "index": int(loopback["index"]),
+                    "name": str(loopback["name"]),
+                    "is_default": default_name in loopback["name"],
+                }
+            )
+        return devices
+    finally:
+        pa.terminate()
+
+
 class SystemAudioCapture:
     """Streams system audio as 16 kHz mono float32 chunks."""
 
-    def __init__(self, target_rate: int = SAMPLE_RATE, chunk_ms: int = 100) -> None:
+    def __init__(
+        self,
+        target_rate: int = SAMPLE_RATE,
+        chunk_ms: int = 100,
+        device_index: int | None = None,
+    ) -> None:
         self.target_rate = target_rate
         self.chunk_ms = chunk_ms
+        # When set, capture this exact loopback device instead of the default one.
+        self.device_index = device_index
         self._pa: pyaudio.PyAudio | None = None
         self._stream = None
         self.device_rate: int = 0
@@ -45,7 +78,10 @@ class SystemAudioCapture:
 
     def start(self) -> None:
         self._pa = pyaudio.PyAudio()
-        device = self._find_loopback_device(self._pa)
+        if self.device_index is not None:
+            device = self._pa.get_device_info_by_index(self.device_index)
+        else:
+            device = self._find_loopback_device(self._pa)
 
         self.device_rate = int(device["defaultSampleRate"])
         self.channels = int(device["maxInputChannels"])
