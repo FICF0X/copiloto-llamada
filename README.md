@@ -7,7 +7,11 @@ speakers), transcribes speech **locally on the GPU**, detects when the other per
 finishes a question, and streams an AI-generated answer into a floating overlay window.
 
 Built for live video calls (Meet, Zoom, interviews): the other person asks something,
-and a few seconds later you have a ready-to-say answer floating on your screen.
+and a few seconds later you have a ready-to-say answer floating on your screen — in
+English to read out loud, with a Spanish translation right beside it so you understand it.
+
+You pick exactly **which audio device** to listen to, so it works even with virtual
+mixers (Voicemeeter, VB-Cable) or multiple outputs.
 
 ---
 
@@ -32,6 +36,11 @@ This isn't a wrapper around a chat API. The hard parts are all client-side and r
 - **Endpointing** — Voice Activity Detection figures out *when a question ends* (by the
   pause), so the AI fires at the right moment instead of on every word.
 - **Streaming answers** — the response appears token by token, in real time.
+- **Offline bilingual output** — the finished answer is translated to Spanish locally
+  with `argostranslate` (runs on the same CTranslate2 engine as Whisper). No API, no
+  Gemini tokens, no rate limits — it never fails mid-call.
+- **Selectable audio source** — a device dropdown lets you capture any output loopback,
+  not just the system default, and your choice is remembered between runs.
 - **Threaded architecture** — audio capture and inference run off the UI thread so the
   overlay never freezes.
 - **Screen-share stealth** (optional) — `SetWindowDisplayAffinity` hides the window from
@@ -48,19 +57,26 @@ This isn't a wrapper around a chat API. The hard parts are all client-side and r
 └──────────────┘   └──────────────┘   └──────────────┘   └──────────────┘
                                                                   ↓
                                                        ┌──────────────────┐
-                                                       │  Floating overlay │
-                                                       │  (PySide6)        │
+                                                       │  Translate (ES)   │
+                                                       │  argostranslate   │
+                                                       │  offline, local   │
                                                        └──────────────────┘
+                                                                  ↓
+                                                       ┌──────────────────────────┐
+                                                       │  Floating overlay (PySide6)│
+                                                       │  EN answer │ ES translation │
+                                                       └──────────────────────────┘
 ```
 
 ## 🛠️ Tech stack
 
 | Layer | Tool |
 |-------|------|
-| Audio capture | `PyAudioWPatch` (WASAPI loopback) |
+| Audio capture | `PyAudioWPatch` (WASAPI loopback, selectable device) |
 | Transcription | `faster-whisper` on CUDA, CPU fallback |
 | Endpointing | `webrtcvad` |
 | AI brain | Google Gemini (`google-genai`) |
+| Translation | `argostranslate` (offline EN→ES, no tokens) |
 | UI | `PySide6` (always-on-top frameless overlay) |
 | Language | Python 3.12 |
 
@@ -80,16 +96,29 @@ py -3.12 -m venv .venv
 
 # 2. Install dependencies
 pip install -r requirements.txt
-
-# 3. (GPU only) install the CUDA runtime libraries
-pip install nvidia-cublas-cu12 nvidia-cudnn-cu12
 ```
+
+> ⚠️ **GPU users — don't skip this.** `faster-whisper` needs the CUDA runtime
+> libraries, which are **not** in `requirements.txt` (they're ~1.2 GB and useless on
+> CPU-only machines). If you have an NVIDIA GPU, install them too:
+>
+> ```bash
+> pip install nvidia-cublas-cu12 nvidia-cudnn-cu12
+> ```
+>
+> Skip this and transcription crashes with `Library cublas64_12.dll is not found`
+> (see [Troubleshooting](#-troubleshooting)). On a CPU-only machine you can skip it —
+> the app falls back to CPU automatically (slower).
 
 Create a `.env` file in the project root with your own API key:
 
 ```
 GEMINI_API_KEY=your_key_here
 ```
+
+> ℹ️ On first launch the offline translator downloads its English→Spanish model
+> (~100 MB) once. That single download needs internet; every translation afterward
+> is fully offline.
 
 ## ▶️ Run
 
@@ -99,8 +128,12 @@ python -m src.main
 
 Or double-click `run.bat`.
 
-Type the meeting context (topic + how you want to answer) in the box, click **Escuchar**,
-and the copilot starts listening.
+Type the meeting context (topic + how you want to answer) in the box, pick your
+**audio source** from the dropdown (the device you actually hear the call through —
+use **⟳** to refresh the list), then click **Escuchar**.
+
+When the other person finishes a question, the English answer streams into the left
+panel and its Spanish translation appears on the right once the answer completes.
 
 ## ⚙️ Configuration
 
@@ -116,11 +149,22 @@ All settings live in [`src/config.py`](src/config.py):
 The screen-share invisibility switch (`HIDE_FROM_SCREENSHARE`) is in
 [`src/main.py`](src/main.py).
 
+## 🩺 Troubleshooting
+
+| Symptom | Cause & fix |
+|---------|-------------|
+| `Library cublas64_12.dll is not found or cannot be loaded` | The CUDA runtime libs aren't installed. Run `pip install nvidia-cublas-cu12 nvidia-cudnn-cu12` (step 3 above). |
+| Status says *Escuchando...* but nothing transcribes | The selected audio source has no sound. Pick the device you actually hear the call through (not a silent/virtual output), and make sure audio is playing. |
+| `py -3.12` → *No suitable Python runtime found* | Python 3.12 isn't installed. Install it (`winget install Python.Python.3.12`) or use the `py` launcher to target a 3.12 you have. |
+| Transcription is wrong or empty | `WHISPER_LANGUAGE` in [`src/config.py`](src/config.py) is locked to `"en"`. Set it to your call's language (e.g. `"es"`) or `None` to auto-detect. |
+
 ## 🗺️ Roadmap
 
+- [x] Offline Spanish translation beside the English answer
+- [x] In-app audio source selector (remembers your choice)
 - [ ] Demo GIF / video in this README
 - [ ] Packaged `.exe` (PyInstaller) on a GitHub Release — run with no Python setup
-- [ ] In-app language selector (English / Spanish)
+- [ ] Selectable translation target language (beyond Spanish)
 - [ ] Conversation memory across the call
 - [ ] Multiple saved context profiles
 

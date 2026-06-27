@@ -23,9 +23,11 @@ class Listener:
         transcriber: Transcriber,
         aggressiveness: int = 2,  # 0..3, higher = filters more non-speech
         min_speech_ms: int = 400,  # ignore blips shorter than this
+        device_index: int | None = None,  # which loopback device to capture
     ) -> None:
         self.vad = webrtcvad.Vad(aggressiveness)
         self.transcriber = transcriber
+        self.device_index = device_index
         self.frame_size = int(SAMPLE_RATE * FRAME_MS / 1000)  # samples per VAD frame
         self.silence_frames_needed = SILENCE_MS_TO_ENDPOINT // FRAME_MS
         self.min_speech_frames = min_speech_ms // FRAME_MS
@@ -40,7 +42,7 @@ class Listener:
         return self.vad.is_speech(pcm16, SAMPLE_RATE)
 
     def listen(self) -> Iterator[str]:
-        cap = SystemAudioCapture()
+        cap = SystemAudioCapture(device_index=self.device_index)
         cap.start()
         self.running = True
 

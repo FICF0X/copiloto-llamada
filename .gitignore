@@ -4,6 +4,13 @@
 # Personal meeting briefing (user-specific runtime data)
 context.txt
 
+# Saved audio device choice (user-specific runtime data)
+audio_device.txt
+
+# ATL and Claudio
+.claude/
+.atl/
+
 # Python virtual environment
 .venv/
 venv/
