@@ -35,6 +35,12 @@ WHISPER_LANGUAGE: str | None = "en"
 # How many ms of silence marks the end of a question (endpointing).
 SILENCE_MS_TO_ENDPOINT: int = 800
 
+# --- Conversation memory ---
+# Past messages (questions + answers) kept in context so follow-up questions
+# like "about what you just mentioned..." make sense. Higher = better memory but
+# more tokens per request. 16 = roughly the last 8 question/answer exchanges.
+MAX_HISTORY_MESSAGES: int = 16
+
 
 def validate() -> None:
     """Fail fast with a clear message if the API key is missing."""

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ctypes
 import sys
+import webbrowser
 
 # Windows: hide the window from screen capture / screen share while keeping it
 # visible to the local user. Requires Windows 10 2004+.
@@ -35,9 +36,14 @@ from src.config import ROOT
 from src.listener import Listener
 from src.transcriber import Transcriber
 from src.translator import Translator
+from src.usage import UsageTracker
 
 CONTEXT_FILE = ROOT / "context.txt"
 DEVICE_FILE = ROOT / "audio_device.txt"
+USAGE_FILE = ROOT / "usage.txt"
+
+# Official Google AI Studio page where the real quota/usage can be checked.
+AI_STUDIO_USAGE_URL = "https://aistudio.google.com/"
 
 
 class CopilotWorker(QThread):
@@ -47,6 +53,8 @@ class CopilotWorker(QThread):
     answer_chunk = Signal(str)
     answer_done = Signal()
     translation_ready = Signal(str)
+    hearing = Signal(str)  # live capture state: idle / speech / transcribing
+    usage_updated = Signal(int)  # new estimated request count for today
     status = Signal(str)
 
     def __init__(
@@ -54,27 +62,43 @@ class CopilotWorker(QThread):
         listener: Listener,
         brain: Brain,
         translator: Translator,
+        usage: UsageTracker,
         context: str = "",
     ) -> None:
         super().__init__()
         self.listener = listener
         self.brain = brain
         self.translator = translator
+        self.usage = usage
         self.context = context
 
     def run(self) -> None:
         self.status.emit("Escuchando...")
+        # Update the briefing but KEEP memory, so pause/resume doesn't lose context.
+        # Memory is only cleared via the "Nueva conversación" button.
+        self.brain.set_context(self.context)
         try:
-            for question in self.listener.listen():
+            for question in self.listener.listen(on_state=self.hearing.emit):
                 self.question_detected.emit(question)
                 self.status.emit("Pensando...")
+                # One answer = one real Gemini request. Count it (estimate).
+                self.usage_updated.emit(self.usage.record())
                 pieces: list[str] = []
                 try:
-                    for piece in self.brain.answer_stream(question, self.context):
+                    for piece in self.brain.answer_stream(question):
                         pieces.append(piece)
                         self.answer_chunk.emit(piece)
                 except Exception as exc:  # noqa: BLE001
-                    self.answer_chunk.emit(f"\n[error al consultar la IA: {exc}]")
+                    detail = str(exc)
+                    if "RESOURCE_EXHAUSTED" in detail or "429" in detail:
+                        self.status.emit("⚠️ Límite de Gemini alcanzado")
+                        self.answer_chunk.emit(
+                            "\n⚠️ Alcanzaste el límite de pedidos de Gemini. "
+                            "Espera un minuto (límite por minuto) o prueba mañana "
+                            "(límite diario)."
+                        )
+                    else:
+                        self.answer_chunk.emit(f"\n[error al consultar la IA: {exc}]")
                 self.answer_done.emit()
 
                 # Translate the finished answer offline (no tokens). Whole-text
@@ -93,12 +117,17 @@ class CopilotWorker(QThread):
 
 class Overlay(QWidget):
     def __init__(
-        self, transcriber: Transcriber, brain: Brain, translator: Translator
+        self,
+        transcriber: Transcriber,
+        brain: Brain,
+        translator: Translator,
+        usage: UsageTracker,
     ) -> None:
         super().__init__()
         self.transcriber = transcriber
         self.brain = brain
         self.translator = translator
+        self.usage = usage
         self.worker: CopilotWorker | None = None
         self._drag_pos = None
         self._build_ui()
@@ -126,15 +155,32 @@ class Overlay(QWidget):
         title.setFont(QFont("Segoe UI", 11, QFont.Bold))
         self.status_label = QLabel("Listo")
         self.status_label.setObjectName("status")
+
+        # Estimated daily request count + a link to Google's official usage page.
+        self.usage_label = QLabel("")
+        self.usage_label.setObjectName("usage")
+        self.usage_label.setToolTip(
+            "Estimado de pedidos REALES de hoy (no es el número oficial de Google). "
+            "Se reinicia a medianoche."
+        )
+        dash_btn = QPushButton("📊")
+        dash_btn.setObjectName("dash")
+        dash_btn.setFixedSize(26, 26)
+        dash_btn.setToolTip("Ver el uso OFICIAL en Google AI Studio")
+        dash_btn.clicked.connect(self._open_usage_dashboard)
+
         close_btn = QPushButton("✕")
         close_btn.setObjectName("close")
         close_btn.setFixedSize(26, 26)
         close_btn.clicked.connect(self.close)
         bar.addWidget(title)
         bar.addStretch()
+        bar.addWidget(self.usage_label)
+        bar.addWidget(dash_btn)
         bar.addWidget(self.status_label)
         bar.addWidget(close_btn)
         layout.addLayout(bar)
+        self._update_usage_label(self.usage.today_count())
 
         # --- Meeting context (briefing) ---
         ctx_label = QLabel("Contexto de la reunión (de qué se habla y cómo responder):")
@@ -171,12 +217,22 @@ class Overlay(QWidget):
         layout.addLayout(dev_row)
         self._populate_devices()
 
-        # --- Toggle button ---
+        # --- Toggle + new-conversation buttons ---
+        btn_row = QHBoxLayout()
         self.toggle_btn = QPushButton("● Escuchar")
         self.toggle_btn.setObjectName("toggle")
         self.toggle_btn.setFixedHeight(40)
         self.toggle_btn.clicked.connect(self._toggle)
-        layout.addWidget(self.toggle_btn)
+
+        self.new_conv_btn = QPushButton("🗑️ Nueva conversación")
+        self.new_conv_btn.setObjectName("newconv")
+        self.new_conv_btn.setFixedHeight(40)
+        self.new_conv_btn.setToolTip("Borra la memoria y empieza una conversación de cero")
+        self.new_conv_btn.clicked.connect(self._new_conversation)
+
+        btn_row.addWidget(self.toggle_btn, stretch=1)
+        btn_row.addWidget(self.new_conv_btn)
+        layout.addLayout(btn_row)
 
         # --- Detected question ---
         self.question_label = QLabel("La pregunta detectada aparecerá acá.")
@@ -214,6 +270,12 @@ class Overlay(QWidget):
         answers_row.addLayout(en_col, stretch=2)
         layout.addLayout(answers_row, stretch=1)
 
+        # --- Live audio/understanding status (bottom) ---
+        self.heard_label = QLabel("🎧 Sin escuchar todavía.")
+        self.heard_label.setObjectName("heard")
+        self.heard_label.setWordWrap(True)
+        layout.addWidget(self.heard_label)
+
         self.setStyleSheet(
             """
             #root {
@@ -223,12 +285,22 @@ class Overlay(QWidget):
             }
             QLabel { color: #e8eaed; }
             #status { color: #9aa0a6; font-size: 11px; }
+            #usage { color: #81c995; font-size: 11px; }
+            QPushButton#dash {
+                background-color: transparent; color: #9aa0a6;
+                border: none; font-size: 13px;
+            }
+            QPushButton#dash:hover { color: #8ab4f8; }
             #question {
                 color: #8ab4f8; font-size: 12px; font-style: italic;
                 padding: 6px 0;
             }
             #ctxlabel { color: #9aa0a6; font-size: 11px; }
             #colheader { color: #9aa0a6; font-size: 11px; font-weight: bold; }
+            #heard {
+                color: #fdd663; font-size: 11px; font-style: italic;
+                padding: 4px 0;
+            }
             QTextEdit#context {
                 background-color: rgba(255,255,255,18); color: #e8eaed;
                 border: 1px solid rgba(120,130,150,70); border-radius: 8px;
@@ -239,6 +311,12 @@ class Overlay(QWidget):
                 border-radius: 8px; font-size: 13px; font-weight: bold;
             }
             QPushButton#toggle:hover { background-color: #1b66c9; }
+            QPushButton#newconv {
+                background-color: rgba(255,255,255,18); color: #e8eaed;
+                border: 1px solid rgba(120,130,150,70); border-radius: 8px;
+                font-size: 12px; padding: 0 12px;
+            }
+            QPushButton#newconv:hover { background-color: rgba(242,139,130,40); }
             QPushButton#close {
                 background-color: transparent; color: #9aa0a6;
                 border: none; font-size: 14px;
@@ -272,6 +350,15 @@ class Overlay(QWidget):
             self._stop_listening()
         else:
             self._start_listening()
+
+    def _new_conversation(self) -> None:
+        """Wipe the AI's memory and start fresh (keeps listening if active)."""
+        context = self.context_box.toPlainText().strip()
+        self.brain.reset(context)
+        self.answer_box.clear()
+        self.translation_box.clear()
+        self.question_label.setText("Conversación reiniciada. Esperando preguntas...")
+        self.heard_label.setText("🗑️ Memoria borrada. Empezamos de cero.")
 
     def _load_context(self) -> str:
         try:
@@ -333,6 +420,7 @@ class Overlay(QWidget):
         self.answer_box.clear()
         self.translation_box.clear()
         self.question_label.setText("Escuchando la llamada...")
+        self.heard_label.setText("🎧 Escuchando la llamada...")
         context = self.context_box.toPlainText().strip()
         self._save_context(context)  # remember it for next time
 
@@ -342,10 +430,14 @@ class Overlay(QWidget):
             self._save_device_name(device["name"])  # remember the choice
 
         listener = Listener(self.transcriber, device_index=device_index)
-        self.worker = CopilotWorker(listener, self.brain, self.translator, context)
+        self.worker = CopilotWorker(
+            listener, self.brain, self.translator, self.usage, context
+        )
         self.worker.question_detected.connect(self._on_question)
         self.worker.answer_chunk.connect(self._on_chunk)
         self.worker.translation_ready.connect(self._on_translation)
+        self.worker.hearing.connect(self._on_hearing)
+        self.worker.usage_updated.connect(self._update_usage_label)
         self.worker.status.connect(self.status_label.setText)
         self.worker.start()
         self.toggle_btn.setText("■ Detener")
@@ -360,8 +452,23 @@ class Overlay(QWidget):
     # --- Signal handlers (run on the UI thread) ---
     def _on_question(self, text: str) -> None:
         self.question_label.setText(f"❓ {text}")
+        self.heard_label.setText(f"👂 Escuché: {text}")
         self.answer_box.clear()
         self.translation_box.clear()
+
+    def _update_usage_label(self, count: int) -> None:
+        self.usage_label.setText(f"📨 ~{count} hoy (est.)")
+
+    def _open_usage_dashboard(self) -> None:
+        webbrowser.open(AI_STUDIO_USAGE_URL)
+
+    def _on_hearing(self, state: str) -> None:
+        messages = {
+            "idle": "🎧 Escuchando la llamada...",
+            "speech": "🎤 La otra persona está hablando...",
+            "transcribing": "🧠 Entendiendo lo que dijo...",
+        }
+        self.heard_label.setText(messages.get(state, "🎧 Escuchando la llamada..."))
 
     def _on_chunk(self, text: str) -> None:
         cursor = self.answer_box.textCursor()
@@ -422,7 +529,8 @@ def main() -> None:
     translator = Translator()
     print(f"[OK] Traductor offline listo: {translator.ready}. Abriendo ventana...")
 
-    window = Overlay(transcriber, brain, translator)
+    usage = UsageTracker(USAGE_FILE)
+    window = Overlay(transcriber, brain, translator, usage)
     window.show()
     sys.exit(app.exec())
 

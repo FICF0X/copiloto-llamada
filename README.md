@@ -13,6 +13,10 @@ English to read out loud, with a Spanish translation right beside it so you unde
 You pick exactly **which audio device** to listen to, so it works even with virtual
 mixers (Voicemeeter, VB-Cable) or multiple outputs.
 
+It **remembers the conversation**, so follow-up questions that refer back to earlier
+answers still make sense, and a live status line shows what it's currently hearing and
+understanding.
+
 ---
 
 ## 🎬 Demo
@@ -41,6 +45,16 @@ This isn't a wrapper around a chat API. The hard parts are all client-side and r
   Gemini tokens, no rate limits — it never fails mid-call.
 - **Selectable audio source** — a device dropdown lets you capture any output loopback,
   not just the system default, and your choice is remembered between runs.
+- **Conversation memory** — a rolling history (capped to bound token cost) is sent with
+  each question, so follow-ups like *"about what you just mentioned, which was hardest?"*
+  resolve correctly. Pausing and resuming keeps the thread; a **New conversation** button
+  clears it on demand.
+- **Live capture feedback** — a status line reflects the real pipeline state (*someone is
+  talking → transcribing → heard: "…"*) so you can tell exactly what the AI picked up.
+- **Honest usage gauge** — Gemini's API exposes no remaining-quota header, so instead of
+  faking it the app shows an *estimated* count of real requests today (resets at midnight)
+  and links to the official Google AI Studio usage page. It also surfaces the `429`
+  rate-limit error clearly instead of failing silently.
 - **Threaded architecture** — audio capture and inference run off the UI thread so the
   overlay never freezes.
 - **Screen-share stealth** (optional) — `SetWindowDisplayAffinity` hides the window from
@@ -67,6 +81,9 @@ This isn't a wrapper around a chat API. The hard parts are all client-side and r
                                                        │  EN answer │ ES translation │
                                                        └──────────────────────────┘
 ```
+
+The **Answer** step also receives a rolling **conversation history**, so the model can
+resolve follow-up questions that refer back to earlier turns.
 
 ## 🛠️ Tech stack
 
@@ -132,8 +149,14 @@ Type the meeting context (topic + how you want to answer) in the box, pick your
 **audio source** from the dropdown (the device you actually hear the call through —
 use **⟳** to refresh the list), then click **Escuchar**.
 
-When the other person finishes a question, the English answer streams into the left
-panel and its Spanish translation appears on the right once the answer completes.
+When the other person finishes a question, the English answer streams into the right
+panel and its Spanish translation appears on the left once the answer completes. The
+bottom status line shows what the app is hearing in real time.
+
+- **🗑️ New conversation** clears the AI's memory and starts a fresh thread. Pausing
+  (Detener) and resuming (Escuchar) keeps the memory; only this button wipes it.
+- The title bar shows **📨 ~N today (est.)** — an estimate of real requests sent today —
+  and a **📊** button that opens the official usage page in Google AI Studio.
 
 ## ⚙️ Configuration
 
@@ -144,7 +167,8 @@ All settings live in [`src/config.py`](src/config.py):
 | `GEMINI_MODEL` | Which Gemini model to use |
 | `WHISPER_MODEL` | Whisper size: `tiny`/`base`/`small`/`medium`/`large` |
 | `WHISPER_LANGUAGE` | `"en"`, `"es"`, … or `None` to auto-detect |
-| `SILENCE_MS_TO_ENDPOINT` | How long a pause counts as "question ended" |
+| `SILENCE_MS_TO_ENDPOINT` | How long a pause (in ms) counts as "question ended" |
+| `MAX_HISTORY_MESSAGES` | How many past messages to keep in memory (higher = better recall, more tokens) |
 
 The screen-share invisibility switch (`HIDE_FROM_SCREENSHARE`) is in
 [`src/main.py`](src/main.py).
@@ -157,19 +181,24 @@ The screen-share invisibility switch (`HIDE_FROM_SCREENSHARE`) is in
 | Status says *Escuchando...* but nothing transcribes | The selected audio source has no sound. Pick the device you actually hear the call through (not a silent/virtual output), and make sure audio is playing. |
 | `py -3.12` → *No suitable Python runtime found* | Python 3.12 isn't installed. Install it (`winget install Python.Python.3.12`) or use the `py` launcher to target a 3.12 you have. |
 | Transcription is wrong or empty | `WHISPER_LANGUAGE` in [`src/config.py`](src/config.py) is locked to `"en"`. Set it to your call's language (e.g. `"es"`) or `None` to auto-detect. |
+| *⚠️ Límite de Gemini alcanzado* | You hit Gemini's free-tier rate limit (per-minute or per-day). Wait a minute or until the daily reset. Check real usage via the **📊** button (Google AI Studio). |
 
 ## 🗺️ Roadmap
 
 - [x] Offline Spanish translation beside the English answer
 - [x] In-app audio source selector (remembers your choice)
+- [x] Conversation memory across the call (with a New conversation reset)
+- [x] Live capture status + estimated daily request counter
 - [ ] Demo GIF / video in this README
 - [ ] Packaged `.exe` (PyInstaller) on a GitHub Release — run with no Python setup
 - [ ] Selectable translation target language (beyond Spanish)
-- [ ] Conversation memory across the call
 - [ ] Multiple saved context profiles
 
 ## 📝 Notes
 
-- Each detected question = 1 API request. Gemini's free tier resets daily.
-- Audio is transcribed **locally**; only the transcribed text is sent to Gemini.
+- Each answered question = 1 Gemini request, plus the running history (conversation
+  memory) sent for context. The in-app counter is an **estimate**; the official number
+  lives in Google AI Studio (📊 button).
+- Audio is transcribed **locally** and translated **locally**; only the transcribed
+  question text is sent to Gemini.
 - This is a client-side desktop app: it must run on your machine to hear your audio.
