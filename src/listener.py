@@ -5,7 +5,7 @@ This is the piece that turns raw audio into discrete questions ready for the AI.
 """
 from __future__ import annotations
 
-from typing import Iterator
+from typing import Callable, Iterator
 
 import numpy as np
 import webrtcvad
@@ -41,7 +41,17 @@ class Listener:
         pcm16 = (np.clip(frame, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
         return self.vad.is_speech(pcm16, SAMPLE_RATE)
 
-    def listen(self) -> Iterator[str]:
+    def listen(self, on_state: Callable[[str], None] | None = None) -> Iterator[str]:
+        """Yield transcribed utterances.
+
+        on_state, if given, is called with live capture states for UI feedback:
+        "idle" (waiting for speech), "speech" (someone is talking),
+        "transcribing" (running Whisper on the finished utterance).
+        """
+        def state(value: str) -> None:
+            if on_state is not None:
+                on_state(value)
+
         cap = SystemAudioCapture(device_index=self.device_index)
         cap.start()
         self.running = True
@@ -51,6 +61,7 @@ class Listener:
         speech_frames = 0
         silence_frames = 0
         in_speech = False
+        state("idle")
 
         try:
             while self.running:
@@ -62,6 +73,8 @@ class Listener:
                     leftover = leftover[self.frame_size :]
 
                     if self._is_speech(frame):
+                        if not in_speech:
+                            state("speech")  # someone just started talking
                         utterance.append(frame)
                         speech_frames += 1
                         silence_frames = 0
@@ -73,6 +86,7 @@ class Listener:
                         # Enough silence after real speech -> utterance ended.
                         if silence_frames >= self.silence_frames_needed:
                             if speech_frames >= self.min_speech_frames:
+                                state("transcribing")
                                 audio = np.concatenate(utterance)
                                 text = self.transcriber.transcribe(audio)
                                 if text:
@@ -82,6 +96,7 @@ class Listener:
                             speech_frames = 0
                             silence_frames = 0
                             in_speech = False
+                            state("idle")
         finally:
             cap.stop()
 

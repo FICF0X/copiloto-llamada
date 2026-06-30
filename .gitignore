@@ -7,6 +7,9 @@ context.txt
 # Saved audio device choice (user-specific runtime data)
 audio_device.txt
 
+# Estimated daily request counter (user-specific runtime data)
+usage.txt
+
 # ATL and Claudio
 .claude/
 .atl/
