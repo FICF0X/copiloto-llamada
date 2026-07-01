@@ -7,6 +7,7 @@ answer streams into the window in real time.
 from __future__ import annotations
 
 import ctypes
+import html
 import sys
 import webbrowser
 
@@ -22,6 +23,7 @@ from PySide6.QtGui import QFont, QMouseEvent, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QDialog,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -53,6 +55,7 @@ class CopilotWorker(QThread):
     answer_chunk = Signal(str)
     answer_done = Signal()
     translation_ready = Signal(str)
+    exchange_recorded = Signal(str, str, str)  # question, answer, translation
     hearing = Signal(str)  # live capture state: idle / speech / transcribing
     usage_updated = Signal(int)  # new estimated request count for today
     status = Signal(str)
@@ -106,7 +109,9 @@ class CopilotWorker(QThread):
                 answer = "".join(pieces).strip()
                 if answer:
                     self.status.emit("Traduciendo...")
-                    self.translation_ready.emit(self.translator.translate(answer))
+                    translation = self.translator.translate(answer)
+                    self.translation_ready.emit(translation)
+                    self.exchange_recorded.emit(question, answer, translation)
                 self.status.emit("Escuchando...")
         except Exception as exc:  # noqa: BLE001
             self.status.emit(f"Error: {exc}")
@@ -130,6 +135,10 @@ class Overlay(QWidget):
         self.usage = usage
         self.worker: CopilotWorker | None = None
         self._drag_pos = None
+        # Full Q&A log for the History window (not trimmed like the AI's memory).
+        self.history_log: list[dict] = []
+        self._history_dialog: QDialog | None = None
+        self._history_view: QTextEdit | None = None
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -224,6 +233,12 @@ class Overlay(QWidget):
         self.toggle_btn.setFixedHeight(40)
         self.toggle_btn.clicked.connect(self._toggle)
 
+        self.history_btn = QPushButton("📜 Historial")
+        self.history_btn.setObjectName("history")
+        self.history_btn.setFixedHeight(40)
+        self.history_btn.setToolTip("Ver todas las preguntas y respuestas de esta conversación")
+        self.history_btn.clicked.connect(self._open_history)
+
         self.new_conv_btn = QPushButton("🗑️ Nueva conversación")
         self.new_conv_btn.setObjectName("newconv")
         self.new_conv_btn.setFixedHeight(40)
@@ -231,6 +246,7 @@ class Overlay(QWidget):
         self.new_conv_btn.clicked.connect(self._new_conversation)
 
         btn_row.addWidget(self.toggle_btn, stretch=1)
+        btn_row.addWidget(self.history_btn)
         btn_row.addWidget(self.new_conv_btn)
         layout.addLayout(btn_row)
 
@@ -317,6 +333,12 @@ class Overlay(QWidget):
                 font-size: 12px; padding: 0 12px;
             }
             QPushButton#newconv:hover { background-color: rgba(242,139,130,40); }
+            QPushButton#history {
+                background-color: rgba(255,255,255,18); color: #e8eaed;
+                border: 1px solid rgba(120,130,150,70); border-radius: 8px;
+                font-size: 12px; padding: 0 12px;
+            }
+            QPushButton#history:hover { background-color: rgba(138,180,248,40); }
             QPushButton#close {
                 background-color: transparent; color: #9aa0a6;
                 border: none; font-size: 14px;
@@ -355,10 +377,12 @@ class Overlay(QWidget):
         """Wipe the AI's memory and start fresh (keeps listening if active)."""
         context = self.context_box.toPlainText().strip()
         self.brain.reset(context)
+        self.history_log = []  # the history window is tied to the conversation
+        self._refresh_history_view()
         self.answer_box.clear()
         self.translation_box.clear()
         self.question_label.setText("Conversación reiniciada. Esperando preguntas...")
-        self.heard_label.setText("🗑️ Memoria borrada. Empezamos de cero.")
+        self.heard_label.setText("🗑️ Memoria e historial borrados. Empezamos de cero.")
 
     def _load_context(self) -> str:
         try:
@@ -436,6 +460,7 @@ class Overlay(QWidget):
         self.worker.question_detected.connect(self._on_question)
         self.worker.answer_chunk.connect(self._on_chunk)
         self.worker.translation_ready.connect(self._on_translation)
+        self.worker.exchange_recorded.connect(self._on_exchange_recorded)
         self.worker.hearing.connect(self._on_hearing)
         self.worker.usage_updated.connect(self._update_usage_label)
         self.worker.status.connect(self.status_label.setText)
@@ -458,6 +483,61 @@ class Overlay(QWidget):
 
     def _update_usage_label(self, count: int) -> None:
         self.usage_label.setText(f"📨 ~{count} hoy (est.)")
+
+    # --- Conversation history window ---
+    def _on_exchange_recorded(self, question: str, answer: str, translation: str) -> None:
+        self.history_log.append(
+            {"question": question, "answer": answer, "translation": translation}
+        )
+        self._refresh_history_view()
+
+    def _history_html(self) -> str:
+        if not self.history_log:
+            return (
+                "<p style='color:#9aa0a6'>Todavía no hay preguntas en esta "
+                "conversación.</p>"
+            )
+        blocks = []
+        for i, entry in enumerate(self.history_log, 1):
+            q = html.escape(entry["question"])
+            a = html.escape(entry["answer"]).replace("\n", "<br>")
+            t = html.escape(entry["translation"]).replace("\n", "<br>")
+            blocks.append(
+                f"<p style='color:#8ab4f8'><b>#{i} &#10067; {q}</b></p>"
+                f"<p style='color:#e8eaed'>&#128483;&#65039; {a}</p>"
+                f"<p style='color:#81c995'>&#128065;&#65039; {t}</p>"
+                "<hr style='border:none;border-top:1px solid #3a3f4b'>"
+            )
+        return "".join(blocks)
+
+    def _refresh_history_view(self) -> None:
+        if self._history_view is not None and self._history_dialog is not None:
+            if self._history_dialog.isVisible():
+                self._history_view.setHtml(self._history_html())
+
+    def _open_history(self) -> None:
+        if self._history_dialog is None:
+            dlg = QDialog(self)
+            dlg.setWindowTitle("Historial de la conversación")
+            dlg.resize(560, 600)
+            dlg.setStyleSheet(
+                "QDialog { background-color: #14161c; }"
+                "QTextEdit { background-color: #1a1c22; color: #e8eaed;"
+                " border: none; padding: 8px; }"
+            )
+            lay = QVBoxLayout(dlg)
+            lay.setContentsMargins(10, 10, 10, 10)
+            view = QTextEdit()
+            view.setReadOnly(True)
+            view.setFont(QFont("Segoe UI", 10))
+            lay.addWidget(view)
+            self._history_dialog = dlg
+            self._history_view = view
+
+        self._history_view.setHtml(self._history_html())
+        self._history_dialog.show()
+        self._history_dialog.raise_()
+        self._history_dialog.activateWindow()
 
     def _open_usage_dashboard(self) -> None:
         webbrowser.open(AI_STUDIO_USAGE_URL)
