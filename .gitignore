@@ -10,6 +10,9 @@ audio_device.txt
 # Estimated daily request counter (user-specific runtime data)
 usage.txt
 
+# Saved listening mode choice (user-specific runtime data)
+listen_mode.txt
+
 # ATL and Claudio
 .claude/
 .atl/

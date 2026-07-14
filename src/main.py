@@ -43,6 +43,7 @@ from src.usage import UsageTracker
 CONTEXT_FILE = ROOT / "context.txt"
 DEVICE_FILE = ROOT / "audio_device.txt"
 USAGE_FILE = ROOT / "usage.txt"
+MODE_FILE = ROOT / "listen_mode.txt"  # "auto" or "controlled", remembered per user
 
 # Official Google AI Studio page where the real quota/usage can be checked.
 AI_STUDIO_USAGE_URL = "https://aistudio.google.com/"
@@ -52,6 +53,7 @@ class CopilotWorker(QThread):
     """Runs the listen -> transcribe -> answer -> translate loop off the UI thread."""
 
     question_detected = Signal(str)
+    partial_text = Signal(str)  # live transcription of what's being heard right now
     answer_chunk = Signal(str)
     answer_done = Signal()
     translation_ready = Signal(str)
@@ -67,6 +69,7 @@ class CopilotWorker(QThread):
         translator: Translator,
         usage: UsageTracker,
         context: str = "",
+        mode: str = "auto",  # "auto" = VAD per-utterance, "controlled" = stop-to-send
     ) -> None:
         super().__init__()
         self.listener = listener
@@ -74,14 +77,25 @@ class CopilotWorker(QThread):
         self.translator = translator
         self.usage = usage
         self.context = context
+        self.mode = mode
 
     def run(self) -> None:
         self.status.emit("Escuchando...")
         # Update the briefing but KEEP memory, so pause/resume doesn't lose context.
         # Memory is only cleared via the "Nueva conversación" button.
         self.brain.set_context(self.context)
+        # Controlled mode records everything until the user stops, then sends one
+        # prompt; auto mode fires on every VAD-detected pause.
+        if self.mode == "controlled":
+            source = self.listener.capture_until_stop(
+                on_state=self.hearing.emit, on_partial=self.partial_text.emit
+            )
+        else:
+            source = self.listener.listen(
+                on_state=self.hearing.emit, on_partial=self.partial_text.emit
+            )
         try:
-            for question in self.listener.listen(on_state=self.hearing.emit):
+            for question in source:
                 self.question_detected.emit(question)
                 self.status.emit("Pensando...")
                 # One answer = one real Gemini request. Count it (estimate).
@@ -226,6 +240,27 @@ class Overlay(QWidget):
         layout.addLayout(dev_row)
         self._populate_devices()
 
+        # --- Listening mode selector ---
+        mode_label = QLabel("Modo de escucha:")
+        mode_label.setObjectName("ctxlabel")
+        layout.addWidget(mode_label)
+
+        self.mode_combo = QComboBox()
+        self.mode_combo.setObjectName("device")
+        # userData is the value passed to the worker; label is what the user sees.
+        self.mode_combo.addItem("🤖 Automático — responde en cada pausa", "auto")
+        self.mode_combo.addItem(
+            "✋ Controlado — junta todo y responde al Detener", "controlled"
+        )
+        self.mode_combo.setToolTip(
+            "Automático: la IA responde cuando detecta una pausa (puede cortar si "
+            "la persona duda).\nControlado: escucha todo hasta que pulsas Detener y "
+            "recién ahí envía la pregunta completa a la IA."
+        )
+        self._select_mode(self._load_mode())
+        self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
+        layout.addWidget(self.mode_combo)
+
         # --- Toggle + new-conversation buttons ---
         btn_row = QHBoxLayout()
         self.toggle_btn = QPushButton("● Escuchar")
@@ -369,7 +404,10 @@ class Overlay(QWidget):
     # --- Listening control ---
     def _toggle(self) -> None:
         if self.worker and self.worker.isRunning():
-            self._stop_listening()
+            if self._selected_mode() == "controlled":
+                self._finish_controlled()
+            else:
+                self._stop_listening()
         else:
             self._start_listening()
 
@@ -440,6 +478,35 @@ class Overlay(QWidget):
         except OSError:
             pass
 
+    # --- Listening mode selection ---
+    def _selected_mode(self) -> str:
+        return self.mode_combo.currentData() or "auto"
+
+    def _select_mode(self, mode: str) -> None:
+        index = self.mode_combo.findData(mode)
+        self.mode_combo.setCurrentIndex(index if index >= 0 else 0)
+
+    def _load_mode(self) -> str:
+        try:
+            return MODE_FILE.read_text(encoding="utf-8").strip() or "auto"
+        except OSError:
+            return "auto"
+
+    def _save_mode(self, mode: str) -> None:
+        try:
+            MODE_FILE.write_text(mode, encoding="utf-8")
+        except OSError:
+            pass
+
+    def _on_mode_changed(self) -> None:
+        """Persist the choice and reflect it in the idle toggle-button label."""
+        self._save_mode(self._selected_mode())
+        if not (self.worker and self.worker.isRunning()):
+            self.toggle_btn.setText(self._idle_toggle_label())
+
+    def _idle_toggle_label(self) -> str:
+        return "● Escuchar"
+
     def _start_listening(self) -> None:
         self.answer_box.clear()
         self.translation_box.clear()
@@ -453,25 +520,49 @@ class Overlay(QWidget):
         if device:
             self._save_device_name(device["name"])  # remember the choice
 
+        mode = self._selected_mode()
         listener = Listener(self.transcriber, device_index=device_index)
         self.worker = CopilotWorker(
-            listener, self.brain, self.translator, self.usage, context
+            listener, self.brain, self.translator, self.usage, context, mode
         )
         self.worker.question_detected.connect(self._on_question)
+        self.worker.partial_text.connect(self._on_partial)
         self.worker.answer_chunk.connect(self._on_chunk)
         self.worker.translation_ready.connect(self._on_translation)
         self.worker.exchange_recorded.connect(self._on_exchange_recorded)
         self.worker.hearing.connect(self._on_hearing)
         self.worker.usage_updated.connect(self._update_usage_label)
         self.worker.status.connect(self.status_label.setText)
+        self.worker.finished.connect(self._on_worker_finished)
         self.worker.start()
-        self.toggle_btn.setText("■ Detener")
+        # Lock the mode while a capture is running so it can't change mid-flight.
+        self.mode_combo.setEnabled(False)
+        if mode == "controlled":
+            self.toggle_btn.setText("■ Detener y responder")
+        else:
+            self.toggle_btn.setText("■ Detener")
+
+    def _finish_controlled(self) -> None:
+        """Controlled mode: stop capturing and let the worker transcribe the whole
+        recording and answer. Non-blocking — the answer streams while we wait."""
+        if self.worker:
+            self.worker.stop()
+        self.toggle_btn.setText("⏳ Procesando...")
+        self.toggle_btn.setEnabled(False)
+        self.status_label.setText("Procesando lo escuchado...")
 
     def _stop_listening(self) -> None:
         if self.worker:
             self.worker.stop()
             self.worker.wait(3000)
-        self.toggle_btn.setText("● Escuchar")
+        self.toggle_btn.setText(self._idle_toggle_label())
+        self.status_label.setText("Listo")
+
+    def _on_worker_finished(self) -> None:
+        """Reset the UI once the worker thread ends (both modes)."""
+        self.mode_combo.setEnabled(True)
+        self.toggle_btn.setEnabled(True)
+        self.toggle_btn.setText(self._idle_toggle_label())
         self.status_label.setText("Listo")
 
     # --- Signal handlers (run on the UI thread) ---
@@ -480,6 +571,10 @@ class Overlay(QWidget):
         self.heard_label.setText(f"👂 Escuché: {text}")
         self.answer_box.clear()
         self.translation_box.clear()
+
+    def _on_partial(self, text: str) -> None:
+        """Live transcription of what's being heard, before the question is final."""
+        self.question_label.setText(f"👂 {text}")
 
     def _update_usage_label(self, count: int) -> None:
         self.usage_label.setText(f"📨 ~{count} hoy (est.)")
@@ -546,6 +641,7 @@ class Overlay(QWidget):
         messages = {
             "idle": "🎧 Escuchando la llamada...",
             "speech": "🎤 La otra persona está hablando...",
+            "capturing": "🔴 Grabando todo... pulsa «Detener» cuando termine la pregunta.",
             "transcribing": "🧠 Entendiendo lo que dijo...",
         }
         self.heard_label.setText(messages.get(state, "🎧 Escuchando la llamada..."))
