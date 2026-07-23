@@ -7,6 +7,7 @@ answer streams into the window in real time.
 from __future__ import annotations
 
 import ctypes
+from ctypes import wintypes
 import html
 import sys
 import webbrowser
@@ -18,14 +19,19 @@ WDA_EXCLUDEFROMCAPTURE = 0x00000011
 # Switch: True = invisible in screen-share/screenshots. False = normal window.
 HIDE_FROM_SCREENSHARE = False
 
-from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtGui import QFont, QMouseEvent, QTextCursor
+# Width of the invisible border used to grab and resize the frameless window.
+RESIZE_MARGIN = 8
+
+from PySide6.QtCore import QPoint, Qt, QThread, Signal
+from PySide6.QtGui import QColor, QFont, QMouseEvent, QPainter, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QPushButton,
     QTextEdit,
     QVBoxLayout,
@@ -44,6 +50,14 @@ CONTEXT_FILE = ROOT / "context.txt"
 DEVICE_FILE = ROOT / "audio_device.txt"
 USAGE_FILE = ROOT / "usage.txt"
 MODE_FILE = ROOT / "listen_mode.txt"  # "auto" or "controlled", remembered per user
+GEOMETRY_FILE = ROOT / "window_geometry.txt"  # remembered window size + position
+FONT_SIZE_FILE = ROOT / "font_size.txt"  # remembered answer/translation font size
+LENGTH_FILE = ROOT / "answer_length.txt"  # remembered answer-length preference
+
+# Answer/translation text zoom bounds (point size).
+FONT_PT_DEFAULT = 11
+FONT_PT_MIN = 8
+FONT_PT_MAX = 28
 
 # Official Google AI Studio page where the real quota/usage can be checked.
 AI_STUDIO_USAGE_URL = "https://aistudio.google.com/"
@@ -134,6 +148,36 @@ class CopilotWorker(QThread):
         self.listener.stop()
 
 
+class ToggleSwitch(QCheckBox):
+    """A sliding ON/OFF switch. Behaves like a checkbox but looks like a toggle."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFixedSize(48, 26)
+
+    def hitButton(self, pos) -> bool:
+        # A plain QCheckBox only reacts on its tiny left indicator; make the WHOLE
+        # painted switch clickable so tapping the right side toggles too.
+        return self.rect().contains(pos)
+
+    def paintEvent(self, event) -> None:  # noqa: ARG002 - Qt signature
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(Qt.NoPen)
+
+        radius = self.height() / 2
+        track = QColor("#1a73e8") if self.isChecked() else QColor("#5f6368")
+        painter.setBrush(track)
+        painter.drawRoundedRect(0, 0, self.width(), self.height(), radius, radius)
+
+        # White knob slides to the right when ON, left when OFF.
+        diameter = self.height() - 6
+        x = self.width() - diameter - 3 if self.isChecked() else 3
+        painter.setBrush(QColor("#ffffff"))
+        painter.drawEllipse(int(x), 3, diameter, diameter)
+
+
 class Overlay(QWidget):
     def __init__(
         self,
@@ -149,10 +193,19 @@ class Overlay(QWidget):
         self.usage = usage
         self.worker: CopilotWorker | None = None
         self._drag_pos = None
+        # Answer/translation text zoom, remembered across sessions.
+        self._font_pt = self._load_font_size()
+        # Answer-length preference, remembered across sessions.
+        self._answer_length = self._load_length()
+        self.brain.set_length(self._answer_length)
+        # Whether the ES translation column is hidden (session-only view toggle).
+        self._answer_only = False
         # Full Q&A log for the History window (not trimmed like the AI's memory).
         self.history_log: list[dict] = []
         self._history_dialog: QDialog | None = None
         self._history_view: QTextEdit | None = None
+        self._history_search: QLineEdit | None = None
+        self._history_filter = ""
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -161,11 +214,12 @@ class Overlay(QWidget):
         )
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.resize(820, 560)  # wide layout: answer (EN) + translation (ES) side by side
+        self.setMinimumSize(460, 380)  # keep it usable when shrunk
 
         root = QWidget(self)
         root.setObjectName("root")
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setContentsMargins(0, 0, 0, 0)  # card fills the window
         outer.addWidget(root)
 
         layout = QVBoxLayout(root)
@@ -192,12 +246,27 @@ class Overlay(QWidget):
         dash_btn.setToolTip("Ver el uso OFICIAL en Google AI Studio")
         dash_btn.clicked.connect(self._open_usage_dashboard)
 
+        # Text zoom controls for the answer + translation panels.
+        zoom_out_btn = QPushButton("A−")
+        zoom_out_btn.setObjectName("zoom")
+        zoom_out_btn.setFixedSize(26, 26)
+        zoom_out_btn.setToolTip("Achicar el texto de la respuesta")
+        zoom_out_btn.clicked.connect(lambda: self._zoom(-1))
+
+        zoom_in_btn = QPushButton("A+")
+        zoom_in_btn.setObjectName("zoom")
+        zoom_in_btn.setFixedSize(26, 26)
+        zoom_in_btn.setToolTip("Agrandar el texto de la respuesta")
+        zoom_in_btn.clicked.connect(lambda: self._zoom(+1))
+
         close_btn = QPushButton("✕")
         close_btn.setObjectName("close")
         close_btn.setFixedSize(26, 26)
         close_btn.clicked.connect(self.close)
         bar.addWidget(title)
         bar.addStretch()
+        bar.addWidget(zoom_out_btn)
+        bar.addWidget(zoom_in_btn)
         bar.addWidget(self.usage_label)
         bar.addWidget(dash_btn)
         bar.addWidget(self.status_label)
@@ -261,6 +330,30 @@ class Overlay(QWidget):
         self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         layout.addWidget(self.mode_combo)
 
+        # --- Answer-length toggle (ON/OFF switch: OFF = short, ON = detailed) ---
+        length_row = QHBoxLayout()
+        length_row.setSpacing(8)
+        length_title = QLabel("Longitud de la respuesta:")
+        length_title.setObjectName("ctxlabel")
+        self.length_off_label = QLabel("✂️ Cortas")
+        self.length_off_label.setObjectName("switchlbl")
+        self.length_switch = ToggleSwitch()
+        self.length_switch.setChecked(self._answer_length == "detailed")
+        self.length_switch.setToolTip(
+            "Cortas: 1-2 frases, para decir rápido en vivo.\n"
+            "Detalladas: respuesta completa y desarrollada."
+        )
+        self.length_switch.toggled.connect(self._on_length_toggled)
+        self.length_on_label = QLabel("📖 Detalladas")
+        self.length_on_label.setObjectName("switchlbl")
+        length_row.addWidget(length_title)
+        length_row.addStretch()
+        length_row.addWidget(self.length_off_label)
+        length_row.addWidget(self.length_switch)
+        length_row.addWidget(self.length_on_label)
+        layout.addLayout(length_row)
+        self._update_length_labels()
+
         # --- Toggle + new-conversation buttons ---
         btn_row = QHBoxLayout()
         self.toggle_btn = QPushButton("● Escuchar")
@@ -295,30 +388,47 @@ class Overlay(QWidget):
         answers_row = QHBoxLayout()
         answers_row.setSpacing(10)
 
-        en_col = QVBoxLayout()
+        # English column, wrapped in a container so the layout can hide/show it.
+        en_container = QWidget()
+        en_col = QVBoxLayout(en_container)
+        en_col.setContentsMargins(0, 0, 0, 0)
         en_col.setSpacing(4)
+        en_header_row = QHBoxLayout()
         en_header = QLabel("🗣️ Respuesta (EN) — lo que dices")
         en_header.setObjectName("colheader")
+        # Toggle to hide the ES column and read the answer full width. Lives in the
+        # EN header so it stays reachable even when the ES column is hidden.
+        self.answer_only_btn = QPushButton("👁️ ES")
+        self.answer_only_btn.setObjectName("zoom")
+        self.answer_only_btn.setFixedHeight(22)
+        self.answer_only_btn.setToolTip("Mostrar/ocultar la columna de traducción (ES)")
+        self.answer_only_btn.clicked.connect(self._toggle_answer_only)
+        en_header_row.addWidget(en_header)
+        en_header_row.addStretch()
+        en_header_row.addWidget(self.answer_only_btn)
         self.answer_box = QTextEdit()
         self.answer_box.setReadOnly(True)
-        self.answer_box.setFont(QFont("Segoe UI", 11))
-        en_col.addWidget(en_header)
+        self.answer_box.setFont(QFont("Segoe UI", self._font_pt))
+        en_col.addLayout(en_header_row)
         en_col.addWidget(self.answer_box, stretch=1)
 
-        es_col = QVBoxLayout()
+        # Spanish column, also wrapped so it can be toggled off entirely.
+        self.es_container = QWidget()
+        es_col = QVBoxLayout(self.es_container)
+        es_col.setContentsMargins(0, 0, 0, 0)
         es_col.setSpacing(4)
         es_header = QLabel("👁️ Traducción (ES) — para entender")
         es_header.setObjectName("colheader")
         self.translation_box = QTextEdit()
         self.translation_box.setReadOnly(True)
-        self.translation_box.setFont(QFont("Segoe UI", 11))
+        self.translation_box.setFont(QFont("Segoe UI", self._font_pt))
         es_col.addWidget(es_header)
         es_col.addWidget(self.translation_box, stretch=1)
 
         # Spanish on the left (support); English on the right as the wider, tall
         # primary column — it's the answer the user actually says out loud.
-        answers_row.addLayout(es_col, stretch=1)
-        answers_row.addLayout(en_col, stretch=2)
+        answers_row.addWidget(self.es_container, stretch=1)
+        answers_row.addWidget(en_container, stretch=2)
         layout.addLayout(answers_row, stretch=1)
 
         # --- Live audio/understanding status (bottom) ---
@@ -342,6 +452,12 @@ class Overlay(QWidget):
                 border: none; font-size: 13px;
             }
             QPushButton#dash:hover { color: #8ab4f8; }
+            QPushButton#zoom {
+                background-color: rgba(255,255,255,18); color: #e8eaed;
+                border: 1px solid rgba(120,130,150,70); border-radius: 6px;
+                font-size: 11px; font-weight: bold;
+            }
+            QPushButton#zoom:hover { background-color: rgba(255,255,255,32); }
             #question {
                 color: #8ab4f8; font-size: 12px; font-style: italic;
                 padding: 6px 0;
@@ -400,6 +516,84 @@ class Overlay(QWidget):
             }
             """
         )
+
+        # Restore the last window size + position, if any.
+        self._load_geometry()
+
+    # --- Text zoom (answer + translation panels) ---
+    def _zoom(self, delta: int) -> None:
+        self._font_pt = max(FONT_PT_MIN, min(FONT_PT_MAX, self._font_pt + delta))
+        font = QFont("Segoe UI", self._font_pt)
+        self.answer_box.setFont(font)
+        self.translation_box.setFont(font)
+        self._save_font_size(self._font_pt)
+
+    def _load_font_size(self) -> int:
+        try:
+            pt = int(FONT_SIZE_FILE.read_text(encoding="utf-8").strip())
+            return max(FONT_PT_MIN, min(FONT_PT_MAX, pt))
+        except (OSError, ValueError):
+            return FONT_PT_DEFAULT
+
+    def _save_font_size(self, pt: int) -> None:
+        try:
+            FONT_SIZE_FILE.write_text(str(pt), encoding="utf-8")
+        except OSError:
+            pass
+
+    # --- Answer length (short vs detailed) ---
+    def _on_length_toggled(self, detailed: bool) -> None:
+        self._answer_length = "detailed" if detailed else "short"
+        self.brain.set_length(self._answer_length)
+        self._save_length(self._answer_length)
+        self._update_length_labels()
+
+    def _update_length_labels(self) -> None:
+        """Highlight the active side so the switch reads clearly."""
+        detailed = self._answer_length == "detailed"
+        active = "color:#e8eaed; font-weight:bold;"
+        dim = "color:#7a7f8a;"
+        self.length_off_label.setStyleSheet(dim if detailed else active)
+        self.length_on_label.setStyleSheet(active if detailed else dim)
+
+    def _load_length(self) -> str:
+        try:
+            value = LENGTH_FILE.read_text(encoding="utf-8").strip()
+            return value if value in ("short", "detailed") else "short"
+        except OSError:
+            return "short"
+
+    def _save_length(self, length: str) -> None:
+        try:
+            LENGTH_FILE.write_text(length, encoding="utf-8")
+        except OSError:
+            pass
+
+    # --- Answer-only view (hide the ES translation column) ---
+    def _toggle_answer_only(self) -> None:
+        self._answer_only = not self._answer_only
+        self.es_container.setVisible(not self._answer_only)
+        self.answer_only_btn.setText("👁️‍🗨️ ES" if self._answer_only else "👁️ ES")
+
+    # --- Window geometry persistence ---
+    def _load_geometry(self) -> None:
+        try:
+            raw = GEOMETRY_FILE.read_text(encoding="utf-8").strip()
+            x, y, w, h = (int(v) for v in raw.split(","))
+        except (OSError, ValueError):
+            return
+        w = max(self.minimumWidth(), w)
+        h = max(self.minimumHeight(), h)
+        self.setGeometry(x, y, w, h)
+
+    def _save_geometry(self) -> None:
+        geo = self.geometry()
+        try:
+            GEOMETRY_FILE.write_text(
+                f"{geo.x()},{geo.y()},{geo.width()},{geo.height()}", encoding="utf-8"
+            )
+        except OSError:
+            pass
 
     # --- Listening control ---
     def _toggle(self) -> None:
@@ -592,8 +786,14 @@ class Overlay(QWidget):
                 "<p style='color:#9aa0a6'>Todavía no hay preguntas en esta "
                 "conversación.</p>"
             )
+        needle = self._history_filter.strip().lower()
         blocks = []
         for i, entry in enumerate(self.history_log, 1):
+            # Filter across question + answer + translation (case-insensitive).
+            if needle and needle not in (
+                f"{entry['question']} {entry['answer']} {entry['translation']}".lower()
+            ):
+                continue
             q = html.escape(entry["question"])
             a = html.escape(entry["answer"]).replace("\n", "<br>")
             t = html.escape(entry["translation"]).replace("\n", "<br>")
@@ -603,7 +803,13 @@ class Overlay(QWidget):
                 f"<p style='color:#81c995'>&#128065;&#65039; {t}</p>"
                 "<hr style='border:none;border-top:1px solid #3a3f4b'>"
             )
-        return "".join(blocks)
+        if not blocks:
+            return (
+                "<p style='color:#9aa0a6'>Sin resultados para "
+                f"«{html.escape(self._history_filter)}».</p>"
+            )
+        # Most recent first: newest exchange shows at the top, no scrolling needed.
+        return "".join(reversed(blocks))
 
     def _refresh_history_view(self) -> None:
         if self._history_view is not None and self._history_dialog is not None:
@@ -622,17 +828,32 @@ class Overlay(QWidget):
             )
             lay = QVBoxLayout(dlg)
             lay.setContentsMargins(10, 10, 10, 10)
+            search = QLineEdit()
+            search.setPlaceholderText("🔎 Buscar en la conversación...")
+            search.setClearButtonEnabled(True)
+            search.setStyleSheet(
+                "QLineEdit { background-color: #1a1c22; color: #e8eaed;"
+                " border: 1px solid #3a3f4b; border-radius: 6px; padding: 6px; }"
+            )
+            search.setText(self._history_filter)
+            search.textChanged.connect(self._on_history_search)
+            lay.addWidget(search)
             view = QTextEdit()
             view.setReadOnly(True)
             view.setFont(QFont("Segoe UI", 10))
             lay.addWidget(view)
             self._history_dialog = dlg
             self._history_view = view
+            self._history_search = search
 
         self._history_view.setHtml(self._history_html())
         self._history_dialog.show()
         self._history_dialog.raise_()
         self._history_dialog.activateWindow()
+
+    def _on_history_search(self, text: str) -> None:
+        self._history_filter = text
+        self._refresh_history_view()
 
     def _open_usage_dashboard(self) -> None:
         webbrowser.open(AI_STUDIO_USAGE_URL)
@@ -656,7 +877,7 @@ class Overlay(QWidget):
     def _on_translation(self, text: str) -> None:
         self.translation_box.setPlainText(text)
 
-    # --- Make the frameless window draggable ---
+    # --- Frameless window: drag the body to move; edges resize via WM_NCHITTEST ---
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.LeftButton:
             self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
@@ -664,6 +885,44 @@ class Overlay(QWidget):
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         if self._drag_pos and event.buttons() & Qt.LeftButton:
             self.move(event.globalPosition().toPoint() - self._drag_pos)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if self._drag_pos is not None:
+            self._save_geometry()  # remember the new position after a drag
+        self._drag_pos = None
+
+    def nativeEvent(self, eventType, message):
+        """Let Windows resize this frameless window by claiming the outer edges as
+        the resize border. Handling WM_NCHITTEST works below Qt's event dispatch,
+        so child widgets can't swallow it and Windows supplies the resize cursors.
+        """
+        if eventType in (b"windows_generic_MSG", "windows_generic_MSG"):
+            msg = wintypes.MSG.from_address(int(message))
+            if msg.message == 0x0084:  # WM_NCHITTEST
+                gx = ctypes.c_int16(msg.lParam & 0xFFFF).value  # signed for multi-monitor
+                gy = ctypes.c_int16((msg.lParam >> 16) & 0xFFFF).value
+                pos = self.mapFromGlobal(QPoint(gx, gy))
+                w, h, m = self.width(), self.height(), RESIZE_MARGIN
+                left, right = pos.x() < m, pos.x() >= w - m
+                top, bottom = pos.y() < m, pos.y() >= h - m
+                # HT* codes: TL=13 TR=14 BL=16 BR=17 L=10 R=11 T=12 B=15
+                if top and left:
+                    return True, 13
+                if top and right:
+                    return True, 14
+                if bottom and left:
+                    return True, 16
+                if bottom and right:
+                    return True, 17
+                if left:
+                    return True, 10
+                if right:
+                    return True, 11
+                if top:
+                    return True, 12
+                if bottom:
+                    return True, 15
+        return super().nativeEvent(eventType, message)
 
     def showEvent(self, event) -> None:
         """When the window appears, exclude it from screen capture (Windows)."""
@@ -689,6 +948,7 @@ class Overlay(QWidget):
             print(f"[!] Stealth no disponible: {exc}")
 
     def closeEvent(self, event) -> None:
+        self._save_geometry()  # persist size/position on exit
         self._stop_listening()
         event.accept()
 

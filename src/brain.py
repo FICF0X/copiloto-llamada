@@ -32,6 +32,18 @@ SYSTEM_PROMPT = (
     "in one line instead of inventing an answer."
 )
 
+# Extra instruction appended per answer-length preference chosen in the UI.
+LENGTH_DIRECTIVES = {
+    "short": (
+        "\n- LENGTH: keep it very brief — 1-2 sentences or a few short bullets. "
+        "Give only what the user needs to say out loud, no preamble."
+    ),
+    "detailed": (
+        "\n- LENGTH: give a thorough answer with the key supporting points, "
+        "still structured to read at a glance."
+    ),
+}
+
 
 class Brain:
     """Wraps the Gemini client and answers questions with conversation memory."""
@@ -41,6 +53,12 @@ class Brain:
         self.client = genai.Client(api_key=GEMINI_API_KEY)
         self.history: list[types.Content] = []  # rolling user/model turns
         self._context = ""  # static meeting briefing for this session
+        self._length = "short"  # answer-length preference: "short" | "detailed"
+
+    def set_length(self, length: str) -> None:
+        """Set the answer-length preference ("short" or "detailed")."""
+        if length in LENGTH_DIRECTIVES:
+            self._length = length
 
     def reset(self, context: str = "") -> None:
         """Wipe conversation memory and set the briefing. Call for a new conversation."""
@@ -54,7 +72,7 @@ class Brain:
     def _make_config(self) -> types.GenerateContentConfig:
         # The static meeting briefing rides in the system instruction (sent every
         # turn) instead of the history, so it never gets trimmed away.
-        system = SYSTEM_PROMPT
+        system = SYSTEM_PROMPT + LENGTH_DIRECTIVES.get(self._length, "")
         if self._context:
             system += (
                 "\n\nMEETING CONTEXT (the topic and how the user wants to answer):\n"

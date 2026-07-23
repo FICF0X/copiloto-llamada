@@ -13,6 +13,11 @@ usage.txt
 # Saved listening mode choice (user-specific runtime data)
 listen_mode.txt
 
+# Saved window size/position and text zoom (user-specific runtime data)
+window_geometry.txt
+font_size.txt
+answer_length.txt
+
 # ATL and Claudio
 .claude/
 .atl/
