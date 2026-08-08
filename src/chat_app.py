@@ -31,14 +31,17 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QPushButton,
     QScrollArea,
     QSizeGrip,
+    QSplitter,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
+from src import conversations
 from src.audio_capture import list_loopback_devices
 from src.brain import Brain
 from src.config import ROOT
@@ -463,7 +466,12 @@ class ChatWindow(QWidget):
         self.translator = translator
         self.usage = usage
         self.worker: CopilotWorker | None = None
-        self.history_log: list[dict] = []
+        # The conversation being recorded right now. Each one is independent: a
+        # new chat never inherits the previous chat's memory.
+        self.convo = conversations.new_conversation()
+        # Id of a saved conversation being read back, or None when the active one
+        # is on screen. Reading an old call never revives it.
+        self._viewing: str | None = None
 
         self._answer_length = self._load_length()
         self.brain.set_length(self._answer_length)
@@ -490,6 +498,7 @@ class ChatWindow(QWidget):
         outer.addWidget(self._build_main(), stretch=1)
 
         self.setStyleSheet(self._stylesheet())
+        self._refresh_recents()  # past calls are there the moment the app opens
         geo = _read_geometry(CHAT_GEOMETRY_FILE)
         if geo:
             self.setGeometry(*geo)
@@ -514,25 +523,47 @@ class ChatWindow(QWidget):
         lay.addWidget(new_btn)
 
         self.search = QLineEdit()
-        self.search.setPlaceholderText("🔎 Buscar en la conversación")
         self.search.setObjectName("search")
+        self.search.setPlaceholderText("🔎 Buscar en tus conversaciones")
         self.search.setClearButtonEnabled(True)
-        self.search.textChanged.connect(self._refresh_history_list)
+        self.search.textChanged.connect(self._refresh_recents)
         lay.addWidget(self.search)
 
-        recents = QLabel("Preguntas")
-        recents.setObjectName("sectionlabel")
-        lay.addWidget(recents)
+        # Saved calls on top, questions inside the open call below. A splitter so
+        # whichever one is being used can take the space.
+        split = QSplitter(Qt.Vertical)
+        split.setObjectName("sidesplit")
+        split.setHandleWidth(6)
 
-        self.history_list = QListWidget()
-        self.history_list.setObjectName("historylist")
-        # Long questions elide instead of forcing a horizontal scrollbar into a
-        # narrow sidebar; the full text stays reachable as a tooltip.
-        self.history_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.history_list.setTextElideMode(Qt.ElideRight)
-        self.history_list.setWordWrap(False)
+        recents_box = QWidget()
+        recents_lay = QVBoxLayout(recents_box)
+        recents_lay.setContentsMargins(0, 0, 0, 0)
+        recents_lay.setSpacing(4)
+        recents_label = QLabel("Conversaciones guardadas")
+        recents_label.setObjectName("sectionlabel")
+        recents_lay.addWidget(recents_label)
+        self.recents_list = self._make_list()
+        self.recents_list.itemClicked.connect(self._on_recent_clicked)
+        self.recents_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.recents_list.customContextMenuRequested.connect(self._on_recent_menu)
+        self.recents_list.setToolTip("Clic para abrir. Clic derecho para borrar.")
+        recents_lay.addWidget(self.recents_list, stretch=1)
+        split.addWidget(recents_box)
+
+        questions_box = QWidget()
+        questions_lay = QVBoxLayout(questions_box)
+        questions_lay.setContentsMargins(0, 0, 0, 0)
+        questions_lay.setSpacing(4)
+        questions_label = QLabel("Preguntas de esta conversación")
+        questions_label.setObjectName("sectionlabel")
+        questions_lay.addWidget(questions_label)
+        self.history_list = self._make_list()
         self.history_list.itemClicked.connect(self._on_history_clicked)
-        lay.addWidget(self.history_list, stretch=1)
+        questions_lay.addWidget(self.history_list, stretch=1)
+        split.addWidget(questions_box)
+
+        split.setSizes([260, 200])
+        lay.addWidget(split, stretch=1)
 
         self.usage_label = QLabel("")
         self.usage_label.setObjectName("usage")
@@ -661,6 +692,7 @@ class ChatWindow(QWidget):
             QListWidget#historylist::item { padding: 7px 8px; border-radius: 8px; }
             QListWidget#historylist::item:hover { background-color: rgba(255,255,255,14); }
             QListWidget#historylist::item:selected { background-color: rgba(138,180,248,40); }
+            QSplitter#sidesplit::handle { background-color: transparent; }
             QTextEdit#contextbox {
                 background-color: #1a1d27; color: #e8eaed;
                 border: 1px solid #2c3140; border-radius: 12px; padding: 9px;
@@ -687,6 +719,15 @@ class ChatWindow(QWidget):
             }
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
         """
+
+    def _make_list(self) -> QListWidget:
+        """Sidebar list styled to elide long text instead of scrolling sideways."""
+        widget = QListWidget()
+        widget.setObjectName("historylist")
+        widget.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        widget.setTextElideMode(Qt.ElideRight)
+        widget.setWordWrap(False)
+        return widget
 
     # ------------------------------------------------------------ settings
     def _selected_mode(self) -> str:
@@ -746,6 +787,10 @@ class ChatWindow(QWidget):
     def _start_listening(self) -> None:
         if self.worker and self.worker.isRunning():
             return
+        # Listening while reading an old call opens a new one instead of
+        # appending to it: saved conversations are a record, not a session.
+        if self._viewing is not None:
+            self._new_conversation()
 
         context = self.context_box.toPlainText().strip()
         _write_text(CONTEXT_FILE, context)
@@ -851,39 +896,106 @@ class ChatWindow(QWidget):
         self.usage_label.setText(f"📨 ~{count} pedidos hoy (est.)")
 
     # -------------------------------------------------------------- history
+    @property
+    def _shown(self) -> list[dict]:
+        """Exchanges currently on screen: a saved call, or the active one."""
+        if self._viewing is not None:
+            saved = conversations.load(self._viewing)
+            return saved.exchanges if saved else []
+        return self.convo.exchanges
+
     def _on_exchange_recorded(self, question: str, answer: str, translation: str) -> None:
-        self.history_log.append(
+        self.convo.exchanges.append(
             {"question": question, "answer": answer, "translation": translation}
         )
+        # Saved after every exchange, not on exit: a crash mid-call must not
+        # cost the transcript.
+        conversations.save(self.convo)
         self._refresh_history_list()
+        self._refresh_recents()
 
     def _refresh_history_list(self) -> None:
-        needle = self.search.text().strip().lower()
         self.history_list.clear()
-        for i, entry in enumerate(self.history_log):
-            haystack = (
-                f"{entry['question']} {entry['answer']} {entry['translation']}".lower()
-            )
-            if needle and needle not in haystack:
-                continue
-            label = entry["question"]
-            item = QListWidgetItem(
-                f"{i + 1}. " + (label[:46] + "…" if len(label) > 46 else label)
-            )
-            item.setToolTip(entry["question"])
+        for i, entry in enumerate(self._shown):
+            question = entry.get("question", "")
+            item = QListWidgetItem(f"{i + 1}. {question}")
+            item.setToolTip(question)
             item.setData(Qt.UserRole, i)
             self.history_list.addItem(item)
 
     def _on_history_clicked(self, item: QListWidgetItem) -> None:
         self.chat.scroll_to_exchange(item.data(Qt.UserRole))
 
-    def _new_conversation(self) -> None:
-        context = self.context_box.toPlainText().strip()
-        self.brain.reset(context)
-        self.history_log = []
+    def _refresh_recents(self) -> None:
+        """Rebuild the saved-calls list, filtered by the sidebar search."""
+        needle = self.search.text().strip()
+        self.recents_list.clear()
+        for conversation in conversations.list_all():
+            if not conversation.matches(needle):
+                continue
+            item = QListWidgetItem(f"{conversation.title}\n{conversation.when}")
+            item.setToolTip(
+                f"{conversation.title}\n{len(conversation.exchanges)} pregunta(s) · "
+                f"{conversation.when}"
+            )
+            item.setData(Qt.UserRole, conversation.id)
+            self.recents_list.addItem(item)
+
+    def _on_recent_clicked(self, item: QListWidgetItem) -> None:
+        """Open a saved call read-only. The AI is NOT given its memory back —
+        every chat stays independent; this is a record, not a resumption."""
+        conv_id = item.data(Qt.UserRole)
+        saved = conversations.load(conv_id)
+        if saved is None:
+            return
+        self._viewing = conv_id
+        self._render(saved.exchanges)
+        self.chat.add_system(
+            "📁 Conversación guardada. Al pulsar «Escuchar» se abre una nueva."
+        )
         self._refresh_history_list()
+        self.listen_btn.setText("●  Escuchar (nueva conversación)")
+
+    def _on_recent_menu(self, point) -> None:
+        item = self.recents_list.itemAt(point)
+        if item is None:
+            return
+        menu = QMenu(self)
+        delete_action = menu.addAction("🗑️ Borrar esta conversación")
+        if menu.exec(self.recents_list.mapToGlobal(point)) is not delete_action:
+            return
+        conv_id = item.data(Qt.UserRole)
+        conversations.delete(conv_id)
+        if self._viewing == conv_id:  # it was on screen: fall back to the active chat
+            self._viewing = None
+            self._render(self.convo.exchanges)
+            self.listen_btn.setText("●  Escuchar la llamada")
+        self._refresh_history_list()
+        self._refresh_recents()
+
+    def _render(self, exchanges: list[dict]) -> None:
+        """Repaint the transcript from stored exchanges."""
         self.chat.clear()
-        self.chat.add_system("🗑️ Memoria e historial borrados. Empezamos de cero.")
+        for entry in exchanges:
+            self.chat.add_question(entry.get("question", ""))
+            self.chat.append_answer(entry.get("answer", ""))
+            translation = entry.get("translation", "")
+            if translation:
+                self.chat.set_translation(translation)
+        self.panel.answer_box.clear()
+        self.panel.set_translation("")
+
+    def _new_conversation(self) -> None:
+        """Start a fresh, independent chat. The previous one is already on disk."""
+        context = self.context_box.toPlainText().strip()
+        conversations.save(self.convo)  # no-op when it has no exchanges
+        self.convo = conversations.new_conversation(context)
+        self._viewing = None
+        self.brain.reset(context)  # each chat starts with no memory, by design
+        self.chat.clear()
+        self._refresh_history_list()
+        self._refresh_recents()
+        self.listen_btn.setText("●  Escuchar la llamada")
         self.panel.answer_box.clear()
         self.panel.set_translation("")
 
@@ -891,6 +1003,7 @@ class ChatWindow(QWidget):
     def closeEvent(self, event) -> None:
         _write_geometry(CHAT_GEOMETRY_FILE, self)
         _write_geometry(PANEL_GEOMETRY_FILE, self.panel)
+        conversations.save(self.convo)
         self._stop_listening()
         self.panel.close()
         event.accept()
