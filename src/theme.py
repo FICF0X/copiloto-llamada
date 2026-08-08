@@ -120,8 +120,15 @@ def elevate(widget: QWidget, blur: int = 38, alpha: int = 150, dy: int = 8) -> N
     widget.setGraphicsEffect(shadow)
 
 
-def stylesheet() -> str:
-    """The whole chat surface, built from the tokens above."""
+def stylesheet(own_corners: bool = False) -> str:
+    """The whole chat surface, built from the tokens above.
+
+    own_corners rounds the shell in CSS. Leave it off when DWM accepted the
+    acrylic backdrop: DWM fills the entire window rect and rounds it itself, so
+    a second radius on top only carves grey wedges out of the corners where our
+    rounding and the compositor's disagree.
+    """
+    shell_radius = f"{RADIUS_LG}px" if own_corners else "0px"
     return f"""
         QWidget {{
             background: transparent;
@@ -134,12 +141,12 @@ def stylesheet() -> str:
         #shell {{
             background-color: {GLASS_BASE};
             border: 1px solid {STROKE};
-            border-radius: {RADIUS_LG}px;
+            border-radius: {shell_radius};
         }}
         #sidebar {{
             background-color: rgba(255, 255, 255, 8);
             border-right: 1px solid {STROKE_SOFT};
-            border-bottom-left-radius: {RADIUS_LG}px;
+            border-bottom-left-radius: {shell_radius};
         }}
         #mainarea {{ background: transparent; }}
 
@@ -300,6 +307,19 @@ def stylesheet() -> str:
 
         QSplitter#sidesplit::handle {{ background: transparent; }}
 
+        /* The transcript/composer divider has to look draggable: it is how the
+           prompt area gets made bigger. */
+        QSplitter#bodysplit::handle {{
+            background: transparent;
+            image: none;
+            border-top: 2px solid rgba(255, 255, 255, 20);
+            margin: 4px 40%;
+            border-radius: 1px;
+        }}
+        QSplitter#bodysplit::handle:hover {{
+            border-top: 2px solid {ACCENT};
+        }}
+
         /* ---- Scrollbars ---- */
         QScrollBar:vertical {{
             background: transparent; width: 10px; margin: 2px;
@@ -325,8 +345,9 @@ def stylesheet() -> str:
     """
 
 
-def panel_stylesheet() -> str:
+def panel_stylesheet(own_corners: bool = False) -> str:
     """The floating Live panel. Same vocabulary, tuned for a small surface."""
+    panel_radius = f"{RADIUS_LG}px" if own_corners else "0px"
     return f"""
         QWidget {{
             background: transparent;
@@ -337,7 +358,7 @@ def panel_stylesheet() -> str:
         #panelcard {{
             background-color: rgba(14, 16, 24, 190);
             border: 1px solid {STROKE};
-            border-radius: {RADIUS_LG}px;
+            border-radius: {panel_radius};
         }}
         #panelstate {{
             color: {WARN};

@@ -21,10 +21,11 @@ import ctypes
 import sys
 
 from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QFont, QTextCursor
+from PySide6.QtGui import QFont, QKeySequence, QShortcut, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -65,6 +66,10 @@ from src.usage import UsageTracker
 # different jobs (reading vs. glancing).
 CHAT_GEOMETRY_FILE = ROOT / "chat_geometry.txt"
 PANEL_GEOMETRY_FILE = ROOT / "panel_geometry.txt"
+# How the transcript/composer split was last dragged, so a prompt the user made
+# room for stays roomy on the next launch.
+SPLIT_FILE = ROOT / "composer_split.txt"
+EDITOR_GEOMETRY_FILE = ROOT / "prompt_editor_geometry.txt"
 
 PANEL_DEFAULT = (60, 60, 460, 340)
 
@@ -433,11 +438,112 @@ class LivePanel(QWidget):
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
-        theme.apply_glass(self, small_corners=True)
+        glass = theme.apply_glass(self, small_corners=True)
+        self.setStyleSheet(theme.panel_stylesheet(own_corners=not glass))
         _apply_stealth(self)
 
     def closeEvent(self, event) -> None:
         _write_geometry(PANEL_GEOMETRY_FILE, self)
+        super().closeEvent(event)
+
+
+class PromptEditor(QDialog):
+    """Full-size editor for the meeting prompt.
+
+    The composer strip is sized for a glance, not for rewriting a long briefing.
+    This gives the prompt a real editing surface — big, resizable, with the line
+    and word count visible — so parts can be reworked or cut without squinting
+    through a four-line window.
+    """
+
+    def __init__(self, parent: QWidget, text: str) -> None:
+        super().__init__(parent)
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Dialog)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setModal(True)
+        self.setMinimumSize(560, 400)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        shell = QWidget()
+        shell.setObjectName("shell")
+        outer.addWidget(shell)
+
+        lay = QVBoxLayout(shell)
+        lay.setContentsMargins(
+            theme.SPACE_LG, theme.SPACE_SM, theme.SPACE_LG, theme.SPACE_LG
+        )
+        lay.setSpacing(theme.SPACE_MD)
+
+        header = DragBar(self)
+        header.setFixedHeight(38)
+        hlay = QHBoxLayout(header)
+        hlay.setContentsMargins(0, 0, 0, 0)
+        title = QLabel("Contexto de la reunión")
+        title.setObjectName("brand")
+        hlay.addWidget(title)
+        hlay.addStretch()
+        close_btn = QPushButton("✕")
+        close_btn.setObjectName("closebtn")
+        close_btn.setFixedSize(32, 28)
+        close_btn.setCursor(Qt.PointingHandCursor)
+        close_btn.clicked.connect(self.reject)
+        hlay.addWidget(close_btn)
+        lay.addWidget(header)
+
+        self.editor = QTextEdit()
+        self.editor.setObjectName("contextbox")
+        self.editor.setFont(QFont("Segoe UI Variable Text", theme.PT_BODY))
+        self.editor.setPlainText(text)
+        self.editor.textChanged.connect(self._update_count)
+        lay.addWidget(self.editor, stretch=1)
+
+        footer = QHBoxLayout()
+        footer.setSpacing(theme.SPACE_SM)
+        self.count_label = QLabel("")
+        self.count_label.setObjectName("chiplabel")
+        footer.addWidget(self.count_label)
+        footer.addStretch()
+
+        cancel_btn = QPushButton("Cancelar")
+        cancel_btn.setObjectName("ghost")
+        cancel_btn.setFixedHeight(36)
+        cancel_btn.setCursor(Qt.PointingHandCursor)
+        cancel_btn.clicked.connect(self.reject)
+
+        save_btn = QPushButton("Guardar")
+        save_btn.setObjectName("primary")
+        save_btn.setFixedHeight(36)
+        save_btn.setCursor(Qt.PointingHandCursor)
+        save_btn.setDefault(True)
+        save_btn.clicked.connect(self.accept)
+
+        footer.addWidget(cancel_btn)
+        footer.addWidget(save_btn)
+        footer.addWidget(QSizeGrip(self), 0, Qt.AlignBottom | Qt.AlignRight)
+        lay.addLayout(footer)
+
+        self._update_count()
+        geo = _read_geometry(EDITOR_GEOMETRY_FILE, (0, 0, 780, 560))
+        self.resize(geo[2], geo[3])
+
+    def _update_count(self) -> None:
+        text = self.editor.toPlainText()
+        words = len(text.split())
+        lines = text.count("\n") + 1 if text else 0
+        self.count_label.setText(f"{words} palabras · {lines} líneas")
+
+    def text(self) -> str:
+        return self.editor.toPlainText().strip()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        glass = theme.apply_glass(self)
+        self.setStyleSheet(theme.stylesheet(own_corners=not glass))
+        self.editor.setFocus()
+
+    def closeEvent(self, event) -> None:
+        _write_geometry(EDITOR_GEOMETRY_FILE, self)
         super().closeEvent(event)
 
 
@@ -505,6 +611,7 @@ class ChatWindow(QWidget):
         shell_lay.addLayout(body, stretch=1)
 
         self.setStyleSheet(theme.stylesheet())
+        QShortcut(QKeySequence("Ctrl+E"), self, self._open_prompt_editor)
         self._refresh_recents()  # past calls are there the moment the app opens
         geo = _read_geometry(CHAT_GEOMETRY_FILE)
         if geo:
@@ -618,15 +725,42 @@ class ChatWindow(QWidget):
         lay.setContentsMargins(theme.SPACE_LG, 0, theme.SPACE_LG, theme.SPACE_LG)
         lay.setSpacing(theme.SPACE_MD)
 
+        # Transcript and composer share a draggable split, so the prompt area can
+        # be pulled as tall as the briefing needs instead of living in four lines.
+        self.body_split = QSplitter(Qt.Vertical)
+        self.body_split.setObjectName("bodysplit")
+        self.body_split.setHandleWidth(10)
+        self.body_split.setChildrenCollapsible(False)
+
         self.chat = ChatView()
-        lay.addWidget(self.chat, stretch=1)
+        self.body_split.addWidget(self.chat)
 
         # --- Composer: the whole call is configured here, before it starts ---
         composer = QWidget()
         composer.setObjectName("composer")
+        composer.setMinimumHeight(180)
         clay = QVBoxLayout(composer)
-        clay.setContentsMargins(16, 10, 16, 14)
-        clay.setSpacing(8)
+        clay.setContentsMargins(16, 12, 16, 14)
+        clay.setSpacing(theme.SPACE_SM)
+
+        # --- Prompt header: says what this is, and offers a way out to a real
+        # editing surface when the briefing is longer than a glance ---
+        ctx_row = QHBoxLayout()
+        ctx_row.setSpacing(theme.SPACE_SM)
+        ctx_label = QLabel("Contexto de la reunión")
+        ctx_label.setObjectName("sectionlabel")
+        expand_btn = QPushButton("⤢  Ampliar")
+        expand_btn.setObjectName("ghost")
+        expand_btn.setFixedHeight(26)
+        expand_btn.setCursor(Qt.PointingHandCursor)
+        expand_btn.setToolTip(
+            "Abrir el prompt en una ventana grande para editarlo cómodo (Ctrl+E)"
+        )
+        expand_btn.clicked.connect(self._open_prompt_editor)
+        ctx_row.addWidget(ctx_label)
+        ctx_row.addStretch()
+        ctx_row.addWidget(expand_btn)
+        clay.addLayout(ctx_row)
 
         self.context_box = QTextEdit()
         self.context_box.setObjectName("contextbox")
@@ -635,10 +769,12 @@ class ChatWindow(QWidget):
             "Ej: Job interview for a backend role. 3 years with Python. "
             "Answer confidently, concise and professional."
         )
-        self.context_box.setFont(QFont("Segoe UI", 10))
-        self.context_box.setFixedHeight(74)
+        self.context_box.setFont(QFont("Segoe UI Variable Text", theme.PT_SMALL))
+        # No fixed height: it takes whatever the split gives it, so dragging the
+        # divider up is what makes the prompt readable.
+        self.context_box.setMinimumHeight(64)
         self.context_box.setPlainText(_read_text(CONTEXT_FILE))
-        clay.addWidget(self.context_box)
+        clay.addWidget(self.context_box, stretch=1)
 
         # Chips row: the few knobs that change per call, inline like a model picker.
         chips = QHBoxLayout()
@@ -696,9 +832,37 @@ class ChatWindow(QWidget):
         clay.addLayout(action_row)
 
         theme.elevate(composer, blur=30, alpha=120, dy=4)
-        lay.addWidget(composer)
+        self.body_split.addWidget(composer)
+        self.body_split.setStretchFactor(0, 1)  # transcript absorbs spare space
+        self.body_split.setStretchFactor(1, 0)
+        self.body_split.setSizes(self._load_split())
+        self.body_split.splitterMoved.connect(lambda *_: self._save_split())
+        lay.addWidget(self.body_split, stretch=1)
         self._update_length_hint()
         return main
+
+    # --- Prompt editing -----------------------------------------------------
+    def _open_prompt_editor(self) -> None:
+        """Edit the prompt in a window that fits it."""
+        dialog = PromptEditor(self, self.context_box.toPlainText())
+        if dialog.exec() == QDialog.Accepted:
+            text = dialog.text()
+            self.context_box.setPlainText(text)
+            _write_text(CONTEXT_FILE, text)
+            # A running call picks up the edit on its next question.
+            self.brain.set_context(text)
+
+    def _load_split(self) -> list[int]:
+        try:
+            top, bottom = (int(v) for v in _read_text(SPLIT_FILE).split(","))
+            return [max(top, 80), max(bottom, 180)]
+        except ValueError:
+            return [420, 220]
+
+    def _save_split(self) -> None:
+        sizes = self.body_split.sizes()
+        if len(sizes) == 2:
+            _write_text(SPLIT_FILE, f"{sizes[0]},{sizes[1]}")
 
     def _make_list(self) -> QListWidget:
         """Sidebar list styled to elide long text instead of scrolling sideways."""
@@ -982,7 +1146,10 @@ class ChatWindow(QWidget):
     # --------------------------------------------------------------- window
     def showEvent(self, event) -> None:
         super().showEvent(event)
-        theme.apply_glass(self)
+        # DWM rounds and clips the window itself when it takes the backdrop; we
+        # only round in CSS when it did not, so the two never fight over corners.
+        glass = theme.apply_glass(self)
+        self.setStyleSheet(theme.stylesheet(own_corners=not glass))
 
     def closeEvent(self, event) -> None:
         _write_geometry(CHAT_GEOMETRY_FILE, self)
