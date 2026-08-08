@@ -41,7 +41,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from src import conversations
+from src import conversations, theme
 from src.audio_capture import list_loopback_devices
 from src.brain import Brain
 from src.config import ROOT
@@ -139,35 +139,54 @@ class DragBar(QWidget):
 class Bubble(QFrame):
     """One message in the transcript. Role decides colour and alignment."""
 
-    ROLES = {
-        # role: (background, text colour, prefix)
-        "question": ("rgba(138,180,248,28)", "#c9dcff", "❓ "),
-        "answer": ("rgba(255,255,255,16)", "#e8eaed", ""),
-        "translation": ("rgba(129,201,149,20)", "#a8d5b5", "👁️ "),
-        "system": ("transparent", "#9aa0a6", ""),
-    }
-
-    def __init__(self, role: str, text: str, font_pt: int = 11) -> None:
+    def __init__(self, role: str, text: str, font_pt: int = theme.PT_BODY) -> None:
         super().__init__()
-        bg, fg, prefix = self.ROLES.get(role, self.ROLES["system"])
+        bg, fg, prefix = theme.bubble_style(role)
         self.setObjectName(f"bubble_{role}")
+        border = (
+            f"1px solid {theme.STROKE_SOFT}" if role != "system" else "none"
+        )
         self.setStyleSheet(
-            f"#bubble_{role} {{ background-color: {bg}; border-radius: 12px; }}"
+            f"#bubble_{role} {{ background-color: {bg};"
+            f" border: {border}; border-radius: {theme.RADIUS_MD}px; }}"
         )
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(12, 9, 12, 9)
+        lay.setContentsMargins(15, 12, 15, 12)
         self.label = QLabel(prefix + text)
         self.label.setWordWrap(True)
         self.label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.label.setFont(QFont("Segoe UI", font_pt))
-        self.label.setStyleSheet(f"color: {fg};")
+        self.label.setFont(QFont("Segoe UI Variable Text", font_pt))
+        # No line-height here: Qt paints it but sizes the label without it, so the
+        # bubble ends up shorter than its own text and clips the last lines.
+        self.label.setStyleSheet(f"color: {fg}; background: transparent;")
         self._prefix = prefix
         self._raw = text  # text without the prefix, so appends stay exact
         lay.addWidget(self.label)
+        self._fit()
+
+    def _fit(self) -> None:
+        """Size the bubble to exactly the height its wrapped text needs.
+
+        A word-wrapped QLabel only reports a useful height via heightForWidth,
+        which QFrame does not propagate, so inside a scroll area the bubble keeps
+        whatever height it had when it was first laid out. That is fine for text
+        set once and wrong for a streamed answer: the bubble stays at its empty
+        height and silently clips everything that arrives after.
+        """
+        margins = self.layout().contentsMargins()
+        inner = max(self.width() - margins.left() - margins.right(), 1)
+        height = self.label.heightForWidth(inner)
+        self.label.setFixedHeight(height)
+        self.setFixedHeight(height + margins.top() + margins.bottom())
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._fit()  # rewrapping on a width change changes the line count
 
     def set_text(self, text: str) -> None:
         self._raw = text
         self.label.setText(self._prefix + text)
+        self._fit()
 
     def append(self, text: str) -> None:
         self.set_text(self._raw + text)
@@ -187,15 +206,26 @@ class ChatView(QScrollArea):
         self._lay.setContentsMargins(16, 16, 16, 16)
         self._lay.setSpacing(10)
 
-        self._empty = QLabel("¿Por dónde empezamos?")
-        self._empty.setAlignment(Qt.AlignCenter)
-        self._empty.setFont(QFont("Segoe UI", 22))
-        self._empty.setStyleSheet("color: #9aa0a6;")
+        self._empty = QWidget()
+        empty_lay = QVBoxLayout(self._empty)
+        empty_lay.setContentsMargins(0, 90, 0, 0)
+        empty_lay.setSpacing(theme.SPACE_SM)
+        headline = QLabel("¿Por dónde empezamos?")
+        headline.setObjectName("emptytitle")
+        headline.setAlignment(Qt.AlignCenter)
+        hint = QLabel(
+            "Escribe el contexto de la reunión abajo y pulsa Escuchar.\n"
+            "La ventana flotante te muestra lo que oye y la respuesta."
+        )
+        hint.setObjectName("emptyhint")
+        hint.setAlignment(Qt.AlignCenter)
+        empty_lay.addWidget(headline)
+        empty_lay.addWidget(hint)
         self._lay.addWidget(self._empty)
         self._lay.addStretch()
 
         self.setWidget(self._body)
-        self._font_pt = 11
+        self._font_pt = theme.PT_BODY
         self._live_answer: Bubble | None = None
         self._live_translation: Bubble | None = None
         self._anchors: list[QWidget] = []  # first bubble of each exchange
@@ -216,7 +246,7 @@ class ChatView(QScrollArea):
         for i in range(self._lay.count()):
             item = self._lay.itemAt(i).widget()
             if isinstance(item, Bubble):
-                item.label.setFont(QFont("Segoe UI", pt))
+                item.label.setFont(QFont("Segoe UI Variable Text", pt))
 
     def add_question(self, text: str) -> None:
         bubble = Bubble("question", text, self._font_pt)
@@ -354,48 +384,8 @@ class LivePanel(QWidget):
         grip_row.addWidget(QSizeGrip(self), 0, Qt.AlignBottom | Qt.AlignRight)
         lay.addLayout(grip_row)
 
-        self.setStyleSheet(
-            """
-            #panelcard {
-                background-color: rgba(18, 20, 26, 244);
-                border: 1px solid rgba(120,130,150,110);
-                border-radius: 14px;
-            }
-            QLabel { color: #e8eaed; }
-            #panelstate { color: #fdd663; font-size: 11px; font-weight: bold; }
-            #panelheard {
-                color: #8ab4f8; font-size: 12px; font-style: italic;
-                background-color: rgba(255,255,255,10);
-                border-radius: 8px; padding: 6px 8px;
-            }
-            QTextEdit#panelanswer {
-                background-color: rgba(255,255,255,14); color: #e8eaed;
-                border: none; border-radius: 8px; padding: 8px;
-            }
-            QTextEdit#paneltranslation {
-                background-color: rgba(129,201,149,18); color: #a8d5b5;
-                border: none; border-radius: 8px; padding: 6px 8px;
-            }
-            QPushButton#panelaction {
-                background-color: #1a73e8; color: white; border: none;
-                border-radius: 8px; font-size: 12px; font-weight: bold;
-            }
-            QPushButton#panelaction:hover { background-color: #1b66c9; }
-            QPushButton#panelaction:disabled {
-                background-color: rgba(255,255,255,20); color: #9aa0a6;
-            }
-            QPushButton#panelghost {
-                background-color: rgba(255,255,255,18); color: #e8eaed;
-                border: 1px solid rgba(120,130,150,70); border-radius: 8px;
-                font-size: 11px; padding: 0 10px;
-            }
-            QPushButton#panelclose {
-                background-color: transparent; color: #9aa0a6;
-                border: none; font-size: 13px;
-            }
-            QPushButton#panelclose:hover { color: #f28b82; }
-            """
-        )
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setStyleSheet(theme.panel_stylesheet())
 
         geo = _read_geometry(PANEL_GEOMETRY_FILE, PANEL_DEFAULT)
         self.setGeometry(*geo)
@@ -443,6 +433,7 @@ class LivePanel(QWidget):
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
+        theme.apply_glass(self, small_corners=True)
         _apply_stealth(self)
 
     def closeEvent(self, event) -> None:
@@ -489,15 +480,31 @@ class ChatWindow(QWidget):
     # ---------------------------------------------------------------- UI
     def _build_ui(self) -> None:
         self.setWindowTitle("Copiloto")
-        self.setMinimumSize(880, 560)
+        self.setMinimumSize(900, 580)
+        # Frameless so the acrylic backdrop and the rounded shell are ours to
+        # define; Windows still supplies the drop shadow and corner rounding.
+        self.setWindowFlags(Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
 
-        outer = QHBoxLayout(self)
+        outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
-        outer.addWidget(self._build_sidebar())
-        outer.addWidget(self._build_main(), stretch=1)
+        shell = QWidget()
+        shell.setObjectName("shell")
+        outer.addWidget(shell)
 
-        self.setStyleSheet(self._stylesheet())
+        shell_lay = QVBoxLayout(shell)
+        shell_lay.setContentsMargins(0, 0, 0, 0)
+        shell_lay.setSpacing(0)
+        shell_lay.addWidget(self._build_header())
+
+        body = QHBoxLayout()
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(0)
+        body.addWidget(self._build_sidebar())
+        body.addWidget(self._build_main(), stretch=1)
+        shell_lay.addLayout(body, stretch=1)
+
+        self.setStyleSheet(theme.stylesheet())
         self._refresh_recents()  # past calls are there the moment the app opens
         geo = _read_geometry(CHAT_GEOMETRY_FILE)
         if geo:
@@ -506,18 +513,16 @@ class ChatWindow(QWidget):
     def _build_sidebar(self) -> QWidget:
         side = QWidget()
         side.setObjectName("sidebar")
-        side.setFixedWidth(240)
+        side.setFixedWidth(252)
         lay = QVBoxLayout(side)
-        lay.setContentsMargins(12, 14, 12, 12)
-        lay.setSpacing(10)
+        lay.setContentsMargins(
+            theme.SPACE_MD, theme.SPACE_MD, theme.SPACE_MD, theme.SPACE_MD
+        )
+        lay.setSpacing(theme.SPACE_MD)
 
-        title = QLabel("🎧 Copiloto")
-        title.setFont(QFont("Segoe UI", 13, QFont.Bold))
-        lay.addWidget(title)
-
-        new_btn = QPushButton("＋  Nueva conversación")
+        new_btn = QPushButton("＋   Nueva conversación")
         new_btn.setObjectName("newchat")
-        new_btn.setFixedHeight(36)
+        new_btn.setFixedHeight(38)
         new_btn.setCursor(Qt.PointingHandCursor)
         new_btn.clicked.connect(self._new_conversation)
         lay.addWidget(new_btn)
@@ -574,12 +579,44 @@ class ChatWindow(QWidget):
         self._update_usage_label(self.usage.today_count())
         return side
 
+    def _build_header(self) -> QWidget:
+        """Own title bar: brand on the left, window controls on the right."""
+        header = DragBar(self)
+        header.setFixedHeight(46)
+        lay = QHBoxLayout(header)
+        lay.setContentsMargins(theme.SPACE_LG, 0, theme.SPACE_SM, 0)
+        lay.setSpacing(theme.SPACE_SM)
+
+        brand = QLabel("◈  Copiloto")
+        brand.setObjectName("brand")
+        lay.addWidget(brand)
+        lay.addStretch()
+
+        self.status_label = QLabel("Listo")
+        self.status_label.setObjectName("status")
+        lay.addWidget(self.status_label)
+
+        for glyph, tip, slot, name in (
+            ("─", "Minimizar", self.showMinimized, "windowbtn"),
+            ("✕", "Cerrar", self.close, "closebtn"),
+        ):
+            button = QPushButton(glyph)
+            button.setObjectName(name)
+            button.setFixedSize(32, 28)
+            button.setCursor(Qt.PointingHandCursor)
+            button.setToolTip(tip)
+            button.clicked.connect(slot)
+            lay.addWidget(button)
+        return header
+
     def _build_main(self) -> QWidget:
         main = QWidget()
         main.setObjectName("mainarea")
         lay = QVBoxLayout(main)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(0)
+        # Margins here are what let the composer read as a card floating over the
+        # transcript rather than a bar welded to the bottom edge.
+        lay.setContentsMargins(theme.SPACE_LG, 0, theme.SPACE_LG, theme.SPACE_LG)
+        lay.setSpacing(theme.SPACE_MD)
 
         self.chat = ChatView()
         lay.addWidget(self.chat, stretch=1)
@@ -635,7 +672,7 @@ class ChatWindow(QWidget):
         )
         self.length_switch.toggled.connect(self._on_length_toggled)
         self.length_hint = QLabel("Cortas")
-        self.length_hint.setObjectName("sectionlabel")
+        self.length_hint.setObjectName("chiplabel")
 
         chips.addWidget(self.device_combo, stretch=2)
         chips.addWidget(self.mode_combo, stretch=1)
@@ -653,72 +690,15 @@ class ChatWindow(QWidget):
         self.listen_btn.setFixedHeight(42)
         self.listen_btn.setCursor(Qt.PointingHandCursor)
         self.listen_btn.clicked.connect(self._toggle)
-
-        self.status_label = QLabel("Listo")
-        self.status_label.setObjectName("status")
-
         action_row.addWidget(self.listen_btn, stretch=1)
-        action_row.addWidget(self.status_label)
+        # Resize handle for the frameless shell, tucked beside the main action.
+        action_row.addWidget(QSizeGrip(self), 0, Qt.AlignBottom | Qt.AlignRight)
         clay.addLayout(action_row)
 
+        theme.elevate(composer, blur=30, alpha=120, dy=4)
         lay.addWidget(composer)
         self._update_length_hint()
         return main
-
-    def _stylesheet(self) -> str:
-        return """
-            QWidget { background-color: #0f1117; color: #e8eaed; }
-            #sidebar { background-color: #161821; border-right: 1px solid #232733; }
-            #mainarea { background-color: #0f1117; }
-            #composer { background-color: #14161e; border-top: 1px solid #232733; }
-            #sectionlabel { color: #7a808c; font-size: 11px; }
-            #status { color: #9aa0a6; font-size: 11px; }
-            #usage { color: #81c995; font-size: 11px; }
-            QPushButton#newchat {
-                background-color: rgba(255,255,255,14); color: #e8eaed;
-                border: 1px solid #2c3140; border-radius: 10px;
-                font-size: 12px; text-align: left; padding-left: 12px;
-            }
-            QPushButton#newchat:hover { background-color: rgba(138,180,248,34); }
-            QLineEdit#search {
-                background-color: rgba(255,255,255,12); color: #e8eaed;
-                border: 1px solid #2c3140; border-radius: 10px;
-                padding: 7px 10px; font-size: 12px;
-            }
-            QListWidget#historylist {
-                background-color: transparent; border: none;
-                color: #c3c7ce; font-size: 12px;
-            }
-            QListWidget#historylist::item { padding: 7px 8px; border-radius: 8px; }
-            QListWidget#historylist::item:hover { background-color: rgba(255,255,255,14); }
-            QListWidget#historylist::item:selected { background-color: rgba(138,180,248,40); }
-            QSplitter#sidesplit::handle { background-color: transparent; }
-            QTextEdit#contextbox {
-                background-color: #1a1d27; color: #e8eaed;
-                border: 1px solid #2c3140; border-radius: 12px; padding: 9px;
-            }
-            QComboBox#chip {
-                background-color: #1a1d27; color: #e8eaed;
-                border: 1px solid #2c3140; border-radius: 16px;
-                padding: 6px 12px; font-size: 11px;
-            }
-            QComboBox#chip QAbstractItemView {
-                background-color: #1a1d27; color: #e8eaed;
-                selection-background-color: #1a73e8;
-            }
-            QPushButton#primary {
-                background-color: #1a73e8; color: white; border: none;
-                border-radius: 12px; font-size: 13px; font-weight: bold;
-            }
-            QPushButton#primary:hover { background-color: #1b66c9; }
-            QScrollBar:vertical {
-                background: transparent; width: 8px; margin: 0;
-            }
-            QScrollBar::handle:vertical {
-                background: #2c3140; border-radius: 4px; min-height: 30px;
-            }
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-        """
 
     def _make_list(self) -> QListWidget:
         """Sidebar list styled to elide long text instead of scrolling sideways."""
@@ -1000,6 +980,10 @@ class ChatWindow(QWidget):
         self.panel.set_translation("")
 
     # --------------------------------------------------------------- window
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        theme.apply_glass(self)
+
     def closeEvent(self, event) -> None:
         _write_geometry(CHAT_GEOMETRY_FILE, self)
         _write_geometry(PANEL_GEOMETRY_FILE, self.panel)
