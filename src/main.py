@@ -22,7 +22,7 @@ HIDE_FROM_SCREENSHARE = False
 # Width of the invisible border used to grab and resize the frameless window.
 RESIZE_MARGIN = 8
 
-from PySide6.QtCore import QPoint, Qt, QThread, Signal
+from PySide6.QtCore import QPoint, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QMouseEvent, QPainter, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
@@ -206,6 +206,11 @@ class Overlay(QWidget):
         self._history_view: QTextEdit | None = None
         self._history_search: QLineEdit | None = None
         self._history_filter = ""
+        # Ticks a seconds counter while the answer is being prepared. A long
+        # transcription is normal; a button that never changes reads as frozen.
+        self._processing_secs = 0
+        self._processing_timer = QTimer(self)
+        self._processing_timer.timeout.connect(self._tick_processing)
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -741,9 +746,17 @@ class Overlay(QWidget):
         recording and answer. Non-blocking — the answer streams while we wait."""
         if self.worker:
             self.worker.stop()
-        self.toggle_btn.setText("⏳ Procesando...")
+        self._processing_secs = 0
+        self.toggle_btn.setText("⏳ Procesando... 0s")
         self.toggle_btn.setEnabled(False)
         self.status_label.setText("Procesando lo escuchado...")
+        self._processing_timer.start(1000)
+
+    def _tick_processing(self) -> None:
+        """Keep the disabled button visibly counting so a long wait still reads
+        as work in progress rather than a hang."""
+        self._processing_secs += 1
+        self.toggle_btn.setText(f"⏳ Procesando... {self._processing_secs}s")
 
     def _stop_listening(self) -> None:
         if self.worker:
@@ -754,6 +767,7 @@ class Overlay(QWidget):
 
     def _on_worker_finished(self) -> None:
         """Reset the UI once the worker thread ends (both modes)."""
+        self._processing_timer.stop()
         self.mode_combo.setEnabled(True)
         self.toggle_btn.setEnabled(True)
         self.toggle_btn.setText(self._idle_toggle_label())

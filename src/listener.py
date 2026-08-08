@@ -12,11 +12,38 @@ import numpy as np
 import webrtcvad
 
 from src.audio_capture import SystemAudioCapture
-from src.config import FRAME_MS, SAMPLE_RATE, SILENCE_MS_TO_ENDPOINT
+from src.config import (
+    FRAME_MS,
+    MAX_UTTERANCE_S,
+    PARTIAL_JOIN_TIMEOUT_S,
+    PARTIAL_WINDOW_S,
+    SAMPLE_RATE,
+    SILENCE_MS_TO_ENDPOINT,
+)
 from src.transcriber import Transcriber
 
 # How often the live-transcription thread refreshes the partial text (seconds).
 PARTIAL_INTERVAL_S = 1.0
+
+
+def _tail(frames: list[np.ndarray], max_samples: int) -> np.ndarray:
+    """Concatenate only the LAST max_samples worth of audio from frames.
+
+    Copying just the tail is what keeps the live preview cheap: cost depends on
+    the window, not on how long the recording has been running.
+    """
+    picked: list[np.ndarray] = []
+    total = 0
+    for frame in reversed(frames):
+        picked.append(frame)
+        total += frame.size
+        if total >= max_samples:
+            break
+    if not picked:
+        return np.zeros(0, dtype=np.float32)
+    picked.reverse()
+    audio = np.concatenate(picked)
+    return audio[-max_samples:] if audio.size > max_samples else audio
 
 
 class Listener:
@@ -35,6 +62,8 @@ class Listener:
         self.frame_size = int(SAMPLE_RATE * FRAME_MS / 1000)  # samples per VAD frame
         self.silence_frames_needed = SILENCE_MS_TO_ENDPOINT // FRAME_MS
         self.min_speech_frames = min_speech_ms // FRAME_MS
+        self.partial_window_samples = int(SAMPLE_RATE * PARTIAL_WINDOW_S)
+        self.max_utterance_frames = int(MAX_UTTERANCE_S * 1000) // FRAME_MS
         self.running = False
         # Serializes ALL model use so the live-transcription thread and the final
         # transcription never hit Whisper at the same time.
@@ -43,6 +72,20 @@ class Listener:
     def _transcribe_locked(self, audio: np.ndarray) -> str:
         with self._model_lock:
             return self.transcriber.transcribe(audio)
+
+    def _transcribe_preview(self, audio: np.ndarray) -> str:
+        """Transcribe for the live preview, but only if the model is free.
+
+        Never waits for the lock: the final transcription is what the user is
+        actually waiting on, so it always wins the model. A skipped preview just
+        costs one missed refresh, which nobody notices.
+        """
+        if not self._model_lock.acquire(blocking=False):
+            return ""
+        try:
+            return self.transcriber.transcribe(audio)
+        finally:
+            self._model_lock.release()
 
     def stop(self) -> None:
         """Signal listen() to stop after the current chunk (~100 ms latency)."""
@@ -61,8 +104,10 @@ class Listener:
         mid-thought. Letting the user press Stop puts that decision where the
         semantic knowledge actually lives — with the human.
 
-        on_partial, if given, receives the live transcription of everything heard
-        so far, refreshed on a background thread so capture never stalls.
+        on_partial, if given, receives the live transcription of the last
+        PARTIAL_WINDOW_S seconds heard, refreshed on a background thread so
+        capture never stalls. It is a "still hearing you" indicator, not the
+        transcript — the full recording is transcribed once, at the end.
         """
         def state(value: str) -> None:
             if on_state is not None:
@@ -81,12 +126,14 @@ class Listener:
             while not stop_partial.wait(PARTIAL_INTERVAL_S):
                 with frames_lock:
                     n = len(frames)
-                    snap = np.concatenate(frames) if n > last_len else None
+                    snap = _tail(frames, self.partial_window_samples) if n > last_len else None
                 if snap is None:
                     continue
                 last_len = n
-                text = self._transcribe_locked(snap)
-                if text and on_partial is not None:
+                text = self._transcribe_preview(snap)
+                # Drop the result if capture stopped meanwhile: from that point
+                # on the final transcription owns what the user sees.
+                if text and not stop_partial.is_set() and on_partial is not None:
                     on_partial(text)
 
         worker = None
@@ -103,7 +150,10 @@ class Listener:
         finally:
             stop_partial.set()
             if worker is not None:
-                worker.join()  # ensure no partial transcribe overlaps the final one
+                # Bounded: a preview pass is capped by the window, but if one
+                # ever hangs it must not hold the answer hostage. The thread is
+                # a daemon and its late result is discarded anyway.
+                worker.join(PARTIAL_JOIN_TIMEOUT_S)
             cap.stop()
 
         if not frames:
@@ -129,9 +179,9 @@ class Listener:
         "idle" (waiting for speech), "speech" (someone is talking),
         "transcribing" (running Whisper on the finished utterance).
 
-        on_partial, if given, receives the live transcription of the CURRENT
-        utterance as it grows, refreshed on a background thread so the VAD loop
-        never stalls waiting on Whisper.
+        on_partial, if given, receives the live transcription of the last
+        PARTIAL_WINDOW_S seconds of the CURRENT utterance, refreshed on a
+        background thread so the VAD loop never stalls waiting on Whisper.
         """
         def state(value: str) -> None:
             if on_state is not None:
@@ -159,12 +209,16 @@ class Listener:
                     n = len(utterance)
                     if n < last_len:  # utterance was reset -> a new one started
                         last_len = 0
-                    snap = np.concatenate(utterance) if n > last_len and n else None
+                    snap = (
+                        _tail(utterance, self.partial_window_samples)
+                        if n > last_len and n
+                        else None
+                    )
                 if snap is None:
                     continue
                 last_len = n
-                text = self._transcribe_locked(snap)
-                if text and on_partial is not None:
+                text = self._transcribe_preview(snap)
+                if text and not stop_partial.is_set() and on_partial is not None:
                     on_partial(text)
 
         worker = None
@@ -186,34 +240,44 @@ class Listener:
                             state("speech")  # someone just started talking
                         with utt_lock:
                             utterance.append(frame)
+                            utt_frames = len(utterance)
                         speech_frames += 1
                         silence_frames = 0
                         in_speech = True
                     elif in_speech:
                         with utt_lock:
                             utterance.append(frame)  # keep trailing silence for context
+                            utt_frames = len(utterance)
                         silence_frames += 1
+                    else:
+                        continue  # silence outside an utterance: nothing to close
 
-                        # Enough silence after real speech -> utterance ended.
-                        if silence_frames >= self.silence_frames_needed:
-                            if speech_frames >= self.min_speech_frames:
-                                state("transcribing")
-                                with utt_lock:
-                                    audio = np.concatenate(utterance)
-                                text = self._transcribe_locked(audio)
-                                if text:
-                                    yield text
-                            # reset for the next utterance (in place, keeps ref)
-                            with utt_lock:
-                                utterance.clear()
-                            speech_frames = 0
-                            silence_frames = 0
-                            in_speech = False
-                            state("idle")
+                    # Close the utterance on a real pause, or when it has run so
+                    # long that waiting for a pause would only keep growing the
+                    # buffer — and the cost of transcribing it — without bound.
+                    paused = silence_frames >= self.silence_frames_needed
+                    too_long = utt_frames >= self.max_utterance_frames
+                    if not (paused or too_long):
+                        continue
+
+                    if speech_frames >= self.min_speech_frames:
+                        state("transcribing")
+                        with utt_lock:
+                            audio = np.concatenate(utterance)
+                        text = self._transcribe_locked(audio)
+                        if text:
+                            yield text
+                    # reset for the next utterance (in place, keeps ref)
+                    with utt_lock:
+                        utterance.clear()
+                    speech_frames = 0
+                    silence_frames = 0
+                    in_speech = False
+                    state("idle")
         finally:
             stop_partial.set()
             if worker is not None:
-                worker.join()
+                worker.join(PARTIAL_JOIN_TIMEOUT_S)
             cap.stop()
 
 

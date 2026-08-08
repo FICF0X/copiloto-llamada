@@ -18,6 +18,9 @@ GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
 # --- Gemini model ---
 # Flash Lite 3.1: free tier gives 500 requests/day (vs 20 for others) + 15 RPM.
 GEMINI_MODEL: str = "gemini-3.1-flash-lite"
+# Milliseconds the API may go silent before the request is aborted. Without a
+# timeout a stalled stream blocks the worker thread, and the UI with it, forever.
+GEMINI_TIMEOUT_MS: int = 60_000
 
 # --- Audio ---
 SAMPLE_RATE: int = 16_000  # Whisper expects 16 kHz mono.
@@ -34,6 +37,22 @@ WHISPER_LANGUAGE: str | None = "en"
 
 # How many ms of silence marks the end of a question (endpointing).
 SILENCE_MS_TO_ENDPOINT: int = 800
+
+# --- Live transcription (the preview shown while someone is still talking) ---
+# The preview transcribes only the most recent slice of audio, never the whole
+# recording. Without this cap each refresh re-transcribes an ever-growing buffer,
+# so the work per refresh grows with the recording until Whisper can no longer
+# keep up and the app appears frozen.
+# 15 s measured at ~0.7 s per pass on an RTX 3050; 20 s jumps to ~2 s because the
+# clip stops fitting Whisper's internal 30 s window cleanly.
+PARTIAL_WINDOW_S: float = 15.0
+# How long to wait for an in-flight preview pass when capture stops, before
+# giving up on it and going straight to the final transcription.
+PARTIAL_JOIN_TIMEOUT_S: float = 5.0
+# Auto mode: force an endpoint when someone has talked this long without a real
+# pause, so a speaker who never pauses cannot grow a single utterance without
+# bound (and with it, the cost of every transcription pass over it).
+MAX_UTTERANCE_S: float = 45.0
 
 # --- Conversation memory ---
 # Past messages (questions + answers) kept in context so follow-up questions
