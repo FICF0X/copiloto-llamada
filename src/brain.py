@@ -13,6 +13,7 @@ from google.genai import types
 from src.config import (
     GEMINI_API_KEY,
     GEMINI_MODEL,
+    GEMINI_TIMEOUT_MS,
     MAX_HISTORY_MESSAGES,
     validate,
 )
@@ -84,6 +85,10 @@ class Brain:
             # Disable the model's internal "thinking" step for lower latency in a
             # live call. Set a positive budget if you want deeper reasoning instead.
             thinking_config=types.ThinkingConfig(thinking_budget=0),
+            # Abort the request if the API goes silent this long. Without it a
+            # stalled stream blocks the worker thread — and the UI waiting on it
+            # — with no way out but restarting the app.
+            http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT_MS),
         )
 
     def _trim(self) -> None:
@@ -101,22 +106,29 @@ class Brain:
         )
         self._trim()
 
-        stream = self.client.models.generate_content_stream(
-            model=GEMINI_MODEL,
-            contents=self.history,
-            config=self._make_config(),
-        )
         pieces: list[str] = []
-        for chunk in stream:
-            if chunk.text:
-                pieces.append(chunk.text)
-                yield chunk.text
-
-        # Remember our own answer so later questions can refer back to it.
-        self.history.append(
-            types.Content(role="model", parts=[types.Part(text="".join(pieces))])
-        )
-        self._trim()
+        try:
+            stream = self.client.models.generate_content_stream(
+                model=GEMINI_MODEL,
+                contents=self.history,
+                config=self._make_config(),
+            )
+            for chunk in stream:
+                if chunk.text:
+                    pieces.append(chunk.text)
+                    yield chunk.text
+        finally:
+            # Always close the turn, even when the request timed out or failed.
+            # A user message left with no model reply after it would pair up with
+            # the next question and poison every later request.
+            if pieces:
+                # Remember our own answer so later questions can refer back to it.
+                self.history.append(
+                    types.Content(role="model", parts=[types.Part(text="".join(pieces))])
+                )
+            elif self.history and self.history[-1].role == "user":
+                self.history.pop()
+            self._trim()
 
     def answer(self, question: str, context: str = "") -> str:
         """Return the full answer as a single string (resets memory first)."""

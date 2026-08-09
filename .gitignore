@@ -39,3 +39,9 @@ models/
 Thumbs.db
 .vscode/
 .idea/
+
+chat_geometry.txt
+panel_geometry.txt
+conversations/
+composer_split.txt
+prompt_editor_geometry.txt

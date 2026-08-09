@@ -140,23 +140,38 @@ GEMINI_API_KEY=your_key_here
 ## ▶️ Run
 
 ```bash
-python -m src.main
+python -m src.chat_app
 ```
 
 Or double-click `run.bat`.
 
-Type the meeting context (topic + how you want to answer) in the box, pick your
-**audio source** from the dropdown (the device you actually hear the call through —
-use **⟳** to refresh the list), then click **Escuchar**.
+The app has two surfaces, each doing one job.
 
-When the other person finishes a question, the English answer streams into the right
-panel and its Spanish translation appears on the left once the answer completes. The
-bottom status line shows what the app is hearing in real time.
+**The chat window** is where a call is set up, before it starts. Write the meeting
+context (topic + how you want to answer) in the composer — drag the divider above it, or
+press **Ctrl+E**, when the prompt is long enough to deserve a real editor. Pick your
+**audio source** (the device you actually hear the call through), choose a listening
+mode, and hit **Escuchar**.
 
-- **🗑️ New conversation** clears the AI's memory and starts a fresh thread. Pausing
-  (Detener) and resuming (Escuchar) keeps the memory; only this button wipes it.
-- The title bar shows **📨 ~N today (est.)** — an estimate of real requests sent today —
-  and a **📊** button that opens the official usage page in Google AI Studio.
+**The Live panel** is a small always-on-top window that appears while listening. It
+shows what is being heard in real time, sends on one click, and streams the answer in
+place — so you read the answer where your eyes already are, without switching windows.
+Pressing send by accident is recoverable: the button becomes **Cancelar envío**, and
+cancelling keeps the transcription instead of throwing it away.
+
+Listening modes:
+
+- **Controlado** records everything until you press send, then answers the whole thing.
+  Silence can't tell an *"I'm done"* pause from an *"I'm thinking"* pause, so this puts
+  that decision where the semantic knowledge actually lives — with you.
+- **Automático** answers on every detected pause.
+
+Every call is saved to `conversations/` after each exchange, so a crash mid-call can't
+cost the transcript. The sidebar lists them newest-first; search looks *inside* them,
+not just at titles; right-click gives a call a title, clears it, or deletes it.
+
+Chats are independent by design: opening a saved call shows it read-only and never hands
+its memory back to the AI. **＋ Nueva conversación** starts a fresh one.
 
 ## ⚙️ Configuration
 
@@ -169,9 +184,30 @@ All settings live in [`src/config.py`](src/config.py):
 | `WHISPER_LANGUAGE` | `"en"`, `"es"`, … or `None` to auto-detect |
 | `SILENCE_MS_TO_ENDPOINT` | How long a pause (in ms) counts as "question ended" |
 | `MAX_HISTORY_MESSAGES` | How many past messages to keep in memory (higher = better recall, more tokens) |
+| `PARTIAL_WINDOW_S` | Seconds of audio the live preview transcribes. Keep it bounded — see below |
+| `MAX_UTTERANCE_S` | Auto mode: force an endpoint after this long without a pause |
+| `GEMINI_TIMEOUT_MS` | How long the API may go silent before the request is abandoned |
+| `HIDE_FROM_SCREENSHARE` | Hide the windows from screen capture while keeping them visible locally |
 
-The screen-share invisibility switch (`HIDE_FROM_SCREENSHARE`) is in
-[`src/main.py`](src/main.py).
+> ⚠️ `PARTIAL_WINDOW_S` is a performance cliff, not a preference. The live preview
+> re-transcribes its window every second, so the cost has to stay flat as the recording
+> grows. Measured on an RTX 3050 with `whisper-small`: 15s of audio costs ~0.7s per pass,
+> 20s jumps to ~2s once the clip outgrows Whisper's internal 30s window, and an unbounded
+> window reaches ~20s per pass after two minutes — which is what used to make the app
+> look frozen.
+
+## 🗂️ Layout
+
+| Module | Responsibility |
+|--------|----------------|
+| [`src/chat_app.py`](src/chat_app.py) | The UI: chat window, Live panel, prompt editor |
+| [`src/theme.py`](src/theme.py) | Design tokens, stylesheets, Windows 11 acrylic glass |
+| [`src/worker.py`](src/worker.py) | The call loop on a background thread, published as Qt signals |
+| [`src/listener.py`](src/listener.py) | Capture, endpointing, and the bounded live preview |
+| [`src/transcriber.py`](src/transcriber.py) | Whisper on the GPU, CPU fallback |
+| [`src/brain.py`](src/brain.py) | Gemini, streaming, and conversation memory |
+| [`src/translator.py`](src/translator.py) | Offline EN→ES via Argos |
+| [`src/conversations.py`](src/conversations.py) | Saved calls on disk |
 
 ## 🩺 Troubleshooting
 
