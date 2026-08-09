@@ -92,6 +92,7 @@ class CopilotWorker(QThread):
         self.usage = usage
         self.context = context
         self.mode = mode
+        self.cancelled = False
 
     def run(self) -> None:
         self.status.emit("Escuchando...")
@@ -110,6 +111,8 @@ class CopilotWorker(QThread):
             )
         try:
             for question in source:
+                if self.cancelled:
+                    break
                 self.question_detected.emit(question)
                 self.status.emit("Pensando...")
                 # One answer = one real Gemini request. Count it (estimate).
@@ -146,6 +149,16 @@ class CopilotWorker(QThread):
 
     def stop(self) -> None:
         self.listener.stop()
+
+    def cancel(self) -> None:
+        """Abandon this capture: no transcription, no question, no AI request.
+
+        Checked at the top of the loop as well as inside the listener, so a
+        cancel that lands while the final transcription is already running still
+        stops short of spending a Gemini call on an answer nobody wants.
+        """
+        self.cancelled = True
+        self.listener.cancel()
 
 
 class ToggleSwitch(QCheckBox):

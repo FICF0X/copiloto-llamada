@@ -25,10 +25,15 @@ class Conversation:
     updated_at: str
     context: str = ""
     exchanges: list[dict] = field(default_factory=list)
+    # Set by the user; empty means "derive it from the first question".
+    custom_title: str = ""
 
     @property
     def title(self) -> str:
-        """First question asked, which is what makes a call recognisable later."""
+        """What the call is called: the user's own name for it if they gave one,
+        otherwise the first question, which is what makes it recognisable."""
+        if self.custom_title.strip():
+            return self.custom_title.strip()
         for exchange in self.exchanges:
             question = (exchange.get("question") or "").strip()
             if question:
@@ -110,6 +115,7 @@ def load(conv_id: str) -> Conversation | None:
             updated_at=raw.get("updated_at", ""),
             context=raw.get("context", ""),
             exchanges=raw.get("exchanges", []),
+            custom_title=raw.get("custom_title", ""),
         )
     except (OSError, ValueError, KeyError):
         return None

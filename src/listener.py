@@ -65,6 +65,7 @@ class Listener:
         self.partial_window_samples = int(SAMPLE_RATE * PARTIAL_WINDOW_S)
         self.max_utterance_frames = int(MAX_UTTERANCE_S * 1000) // FRAME_MS
         self.running = False
+        self.cancelled = False
         # Serializes ALL model use so the live-transcription thread and the final
         # transcription never hit Whisper at the same time.
         self._model_lock = threading.Lock()
@@ -89,6 +90,16 @@ class Listener:
 
     def stop(self) -> None:
         """Signal listen() to stop after the current chunk (~100 ms latency)."""
+        self.running = False
+
+    def cancel(self) -> None:
+        """Abandon the capture without transcribing it.
+
+        Stop means "I am done talking, answer me"; cancel means "forget it".
+        Skipping the final transcription is what makes cancelling feel instant
+        instead of making the user wait out the work they just called off.
+        """
+        self.cancelled = True
         self.running = False
 
     def capture_until_stop(
@@ -116,6 +127,7 @@ class Listener:
         cap = SystemAudioCapture(device_index=self.device_index)
         cap.start()
         self.running = True
+        self.cancelled = False
 
         frames: list[np.ndarray] = []
         frames_lock = threading.Lock()
@@ -156,7 +168,7 @@ class Listener:
                 worker.join(PARTIAL_JOIN_TIMEOUT_S)
             cap.stop()
 
-        if not frames:
+        if not frames or self.cancelled:
             return
         state("transcribing")
         audio = np.concatenate(frames)
@@ -190,6 +202,7 @@ class Listener:
         cap = SystemAudioCapture(device_index=self.device_index)
         cap.start()
         self.running = True
+        self.cancelled = False
 
         leftover = np.zeros(0, dtype=np.float32)  # samples not yet framed
         # Mutated in place (never reassigned) so the partial thread's reference
@@ -260,7 +273,7 @@ class Listener:
                     if not (paused or too_long):
                         continue
 
-                    if speech_frames >= self.min_speech_frames:
+                    if speech_frames >= self.min_speech_frames and not self.cancelled:
                         state("transcribing")
                         with utt_lock:
                             audio = np.concatenate(utterance)

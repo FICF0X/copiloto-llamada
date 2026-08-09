@@ -335,6 +335,38 @@ def stylesheet(own_corners: bool = False) -> str:
             background: transparent;
         }}
 
+        /* Menus need an explicit opaque fill: the blanket transparent rule above
+           applies to QMenu too, which leaves a popup you can see straight
+           through and cannot read. */
+        QMenu {{
+            background-color: #171A24;
+            color: {INK};
+            border: 1px solid {STROKE};
+            border-radius: {RADIUS_SM}px;
+            padding: 5px;
+        }}
+        QMenu::item {{
+            background-color: transparent;
+            padding: 8px 16px;
+            border-radius: {RADIUS_SM}px;
+            font-size: {PT_SMALL}pt;
+        }}
+        QMenu::item:selected {{ background-color: {ACCENT_SOFT}; color: {INK}; }}
+        QMenu::separator {{
+            height: 1px;
+            background: {STROKE_SOFT};
+            margin: 4px 8px;
+        }}
+
+        QInputDialog, QMessageBox {{ background-color: #171A24; }}
+        QInputDialog QLineEdit {{
+            background-color: {GLASS_SUNK};
+            color: {INK};
+            border: 1px solid {STROKE};
+            border-radius: {RADIUS_SM}px;
+            padding: 8px 10px;
+        }}
+
         QToolTip {{
             background-color: #171A24;
             color: {INK};

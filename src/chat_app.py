@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QFrame,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -305,6 +306,7 @@ class LivePanel(QWidget):
 
     send_requested = Signal()
     listen_requested = Signal()
+    cancel_requested = Signal()
     closed = Signal()
 
     def __init__(self) -> None:
@@ -401,6 +403,8 @@ class LivePanel(QWidget):
     def _on_action(self) -> None:
         if self._mode == "listening":
             self.send_requested.emit()
+        elif self._mode == "processing":
+            self.cancel_requested.emit()
         elif self._mode == "done":
             self.listen_requested.emit()
 
@@ -427,9 +431,12 @@ class LivePanel(QWidget):
         self._sync_translation()
 
     def set_processing(self, seconds: int) -> None:
+        # Stays enabled on purpose: a disabled button here is what turned a slow
+        # answer into a dead app with no way out but restarting.
         self._mode = "processing"
-        self.action_btn.setEnabled(False)
-        self.action_btn.setText(f"⏳ Procesando... {seconds}s")
+        self.action_btn.setEnabled(True)
+        self.action_btn.setText(f"✕ Cancelar envío · {seconds}s")
+        self.action_btn.setToolTip("Descartar este envío y volver a escuchar")
 
     def set_done(self) -> None:
         self._mode = "done"
@@ -576,9 +583,18 @@ class ChatWindow(QWidget):
         self._processing_timer = QTimer(self)
         self._processing_timer.timeout.connect(self._tick_processing)
 
+        # True between pressing send and the answer arriving; while it holds, the
+        # action button cancels instead of sending.
+        self._processing = False
+        self._send_cancelled = False
+        # Last live transcription seen. Kept so cancelling gives it back instead
+        # of throwing away everything the app just heard.
+        self._last_heard = ""
+
         self.panel = LivePanel()
         self.panel.send_requested.connect(self._send_now)
         self.panel.listen_requested.connect(self._start_listening)
+        self.panel.cancel_requested.connect(self._cancel_send)
         self.panel.closed.connect(self._close_panel)
 
         self._build_ui()
@@ -920,7 +936,9 @@ class ChatWindow(QWidget):
 
     # ------------------------------------------------------------- control
     def _toggle(self) -> None:
-        if self.worker and self.worker.isRunning():
+        if self._processing:
+            self._cancel_send()
+        elif self.worker and self.worker.isRunning():
             if self._selected_mode() == "controlled":
                 self._send_now()
             else:
@@ -961,6 +979,9 @@ class ChatWindow(QWidget):
         self.worker.finished.connect(self._on_worker_finished)
         self.worker.start()
 
+        self._last_heard = ""  # a new capture starts from nothing heard
+        self._processing = False
+        self._send_cancelled = False
         self.mode_combo.setEnabled(False)
         self.listen_btn.setText(
             "■  Enviar y responder" if mode == "controlled" else "■  Detener"
@@ -974,17 +995,40 @@ class ChatWindow(QWidget):
         if not (self.worker and self.worker.isRunning()):
             return
         self.worker.stop()
+        self._processing = True
+        self._send_cancelled = False
         self._processing_secs = 0
         self.panel.set_processing(0)
-        self.listen_btn.setEnabled(False)
-        self.listen_btn.setText("⏳  Procesando... 0s")
+        self.listen_btn.setText("✕  Cancelar envío · 0s")
         self.status_label.setText("Procesando lo escuchado...")
         self._processing_timer.start(1000)
+
+    def _cancel_send(self) -> None:
+        """Undo an accidental send: drop the request, keep what was heard.
+
+        The transcription is the expensive part — it is what the other person
+        actually said — so cancelling returns it rather than discarding it, and
+        the next capture starts from a clean slate.
+        """
+        if not self._processing:
+            return
+        self._send_cancelled = True
+        self._processing_timer.stop()
+        if self.worker:
+            self.worker.cancel()
+        self.status_label.setText("Envío cancelado")
+        self.panel.state_label.setText("✕ Envío cancelado")
+        heard = self._last_heard.strip()
+        if heard:
+            self.panel.heard_label.setText(f"👂 {heard}")
+            self.chat.add_system(f"✕ Envío cancelado. Se había escuchado: “{heard}”")
+        else:
+            self.panel.heard_label.setText("Envío cancelado. Nada que conservar.")
 
     def _tick_processing(self) -> None:
         self._processing_secs += 1
         self.panel.set_processing(self._processing_secs)
-        self.listen_btn.setText(f"⏳  Procesando... {self._processing_secs}s")
+        self.listen_btn.setText(f"✕  Cancelar envío · {self._processing_secs}s")
 
     def _stop_listening(self) -> None:
         if self.worker:
@@ -993,12 +1037,18 @@ class ChatWindow(QWidget):
 
     def _on_worker_finished(self) -> None:
         self._processing_timer.stop()
+        self._processing = False
         self.mode_combo.setEnabled(True)
         self.listen_btn.setEnabled(True)
         self.listen_btn.setText("●  Escuchar la llamada")
-        self.status_label.setText("Listo")
         self.panel.set_done()
-        self.panel.state_label.setText("✅ Respuesta lista")
+        if self._send_cancelled:
+            self._send_cancelled = False
+            self.status_label.setText("Envío cancelado")
+            self.panel.state_label.setText("✕ Envío cancelado")
+        else:
+            self.status_label.setText("Listo")
+            self.panel.state_label.setText("✅ Respuesta lista")
 
     def _close_panel(self) -> None:
         self.panel.hide()
@@ -1007,12 +1057,14 @@ class ChatWindow(QWidget):
 
     # -------------------------------------------------------------- signals
     def _on_question(self, text: str) -> None:
+        self._last_heard = text
         self.chat.add_question(text)
         self.panel.heard_label.setText(f"👂 {text}")
         self.panel.answer_box.clear()
         self.panel.set_translation("")
 
     def _on_partial(self, text: str) -> None:
+        self._last_heard = text
         self.panel.heard_label.setText(f"👂 {text}")
 
     def _on_chunk(self, text: str) -> None:
@@ -1080,7 +1132,7 @@ class ChatWindow(QWidget):
             item = QListWidgetItem(f"{conversation.title}\n{conversation.when}")
             item.setToolTip(
                 f"{conversation.title}\n{len(conversation.exchanges)} pregunta(s) · "
-                f"{conversation.when}"
+                f"{conversation.when}\n\nClic derecho para renombrar o borrar."
             )
             item.setData(Qt.UserRole, conversation.id)
             self.recents_list.addItem(item)
@@ -1105,10 +1157,47 @@ class ChatWindow(QWidget):
         if item is None:
             return
         menu = QMenu(self)
-        delete_action = menu.addAction("🗑️ Borrar esta conversación")
-        if menu.exec(self.recents_list.mapToGlobal(point)) is not delete_action:
-            return
+        rename_action = menu.addAction("✏️  Poner título")
+        clear_action = menu.addAction("↩️  Quitar el título")
+        menu.addSeparator()
+        delete_action = menu.addAction("🗑️  Borrar esta conversación")
+
+        chosen = menu.exec(self.recents_list.mapToGlobal(point))
         conv_id = item.data(Qt.UserRole)
+        if chosen is rename_action:
+            self._rename_conversation(conv_id)
+        elif chosen is clear_action:
+            self._set_title(conv_id, "")
+        elif chosen is delete_action:
+            self._delete_conversation(conv_id)
+
+    def _rename_conversation(self, conv_id: str) -> None:
+        saved = conversations.load(conv_id)
+        if saved is None:
+            return
+        title, accepted = QInputDialog.getText(
+            self,
+            "Título de la conversación",
+            "Ponle un nombre que reconozcas después:",
+            text=saved.custom_title or saved.title,
+        )
+        if accepted:
+            self._set_title(conv_id, title)
+
+    def _set_title(self, conv_id: str, title: str) -> None:
+        saved = conversations.load(conv_id)
+        if saved is None:
+            return
+        saved.custom_title = title.strip()
+        conversations.save(saved)
+        # The active conversation is held in memory and rewritten after every
+        # exchange, so its copy has to learn the new title or the next save
+        # would quietly undo the rename.
+        if self.convo.id == conv_id:
+            self.convo.custom_title = saved.custom_title
+        self._refresh_recents()
+
+    def _delete_conversation(self, conv_id: str) -> None:
         conversations.delete(conv_id)
         if self._viewing == conv_id:  # it was on screen: fall back to the active chat
             self._viewing = None
