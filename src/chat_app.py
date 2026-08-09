@@ -21,9 +21,18 @@ import ctypes
 import sys
 
 from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QFont, QKeySequence, QShortcut, QTextCursor
+from PySide6.QtGui import (
+    QColor,
+    QFont,
+    QKeySequence,
+    QLinearGradient,
+    QPainter,
+    QShortcut,
+    QTextCursor,
+)
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
     QFrame,
@@ -34,6 +43,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMenu,
+    QMessageBox,
     QPushButton,
     QScrollArea,
     QSizeGrip,
@@ -46,22 +56,24 @@ from PySide6.QtWidgets import (
 from src import conversations, theme
 from src.audio_capture import list_loopback_devices
 from src.brain import Brain
-from src.config import ROOT
-from src.listener import Listener
-from src.main import (
+from src.config import (
     CONTEXT_FILE,
     DEVICE_FILE,
     HIDE_FROM_SCREENSHARE,
     LENGTH_FILE,
     MODE_FILE,
+    ROOT,
     USAGE_FILE,
-    WDA_EXCLUDEFROMCAPTURE,
-    CopilotWorker,
-    ToggleSwitch,
 )
+from src.listener import Listener
 from src.transcriber import Transcriber
 from src.translator import Translator
 from src.usage import UsageTracker
+from src.worker import CopilotWorker
+
+# Windows: keep the window visible locally but absent from screen capture and
+# screen sharing. Requires Windows 10 2004+.
+WDA_EXCLUDEFROMCAPTURE = 0x00000011
 
 # Geometry of each surface, remembered separately: they are moved and sized for
 # different jobs (reading vs. glancing).
@@ -117,6 +129,41 @@ def _apply_stealth(widget: QWidget) -> None:
         )
     except Exception:  # noqa: BLE001 - stealth is best-effort
         pass
+
+
+class ToggleSwitch(QCheckBox):
+    """A sliding ON/OFF switch. Behaves like a checkbox but looks like a toggle."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFixedSize(46, 24)
+
+    def hitButton(self, pos) -> bool:
+        # A plain QCheckBox only reacts on its tiny left indicator; make the WHOLE
+        # painted switch clickable so tapping the right side toggles too.
+        return self.rect().contains(pos)
+
+    def paintEvent(self, event) -> None:  # noqa: ARG002 - Qt signature
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(Qt.NoPen)
+
+        radius = self.height() / 2
+        if self.isChecked():
+            track = QLinearGradient(0, 0, self.width(), self.height())
+            track.setColorAt(0.0, QColor(theme.ACCENT))
+            track.setColorAt(1.0, QColor(theme.ACCENT_DEEP))
+            painter.setBrush(track)
+        else:
+            painter.setBrush(QColor(255, 255, 255, 40))
+        painter.drawRoundedRect(0, 0, self.width(), self.height(), radius, radius)
+
+        # White knob slides to the right when ON, left when OFF.
+        diameter = self.height() - 6
+        x = self.width() - diameter - 3 if self.isChecked() else 3
+        painter.setBrush(QColor("#ffffff"))
+        painter.drawEllipse(int(x), 3, diameter, diameter)
 
 
 class DragBar(QWidget):
@@ -1198,6 +1245,26 @@ class ChatWindow(QWidget):
         self._refresh_recents()
 
     def _delete_conversation(self, conv_id: str) -> None:
+        saved = conversations.load(conv_id)
+        if saved is None:
+            return
+        # Deleting a transcript cannot be undone and the file is the only copy,
+        # so this asks first — and says what is about to be lost.
+        confirm = QMessageBox(self)
+        confirm.setWindowTitle("Borrar conversación")
+        confirm.setText(f"¿Borrar «{saved.title}»?")
+        confirm.setInformativeText(
+            f"{len(saved.exchanges)} pregunta(s) · {saved.when}\n"
+            "Esto no se puede deshacer."
+        )
+        confirm.setIcon(QMessageBox.Warning)
+        confirm.setStandardButtons(QMessageBox.Cancel | QMessageBox.Yes)
+        confirm.setDefaultButton(QMessageBox.Cancel)
+        confirm.button(QMessageBox.Yes).setText("Borrar")
+        confirm.button(QMessageBox.Cancel).setText("Cancelar")
+        if confirm.exec() != QMessageBox.Yes:
+            return
+
         conversations.delete(conv_id)
         if self._viewing == conv_id:  # it was on screen: fall back to the active chat
             self._viewing = None

@@ -12,6 +12,21 @@ ROOT = Path(__file__).resolve().parent.parent
 # Load variables from .env into the environment.
 load_dotenv(ROOT / ".env")
 
+# --- Where remembered state lives ---
+# Small plain files rather than a settings store: they are easy to inspect, easy
+# to delete when something goes wrong, and survive the app being rewritten.
+CONTEXT_FILE = ROOT / "context.txt"  # the meeting prompt
+DEVICE_FILE = ROOT / "audio_device.txt"  # last chosen loopback device
+USAGE_FILE = ROOT / "usage.txt"  # estimated requests sent today
+MODE_FILE = ROOT / "listen_mode.txt"  # "auto" or "controlled"
+LENGTH_FILE = ROOT / "answer_length.txt"  # "short" or "detailed"
+CONVERSATIONS_DIR = ROOT / "conversations"  # one JSON per saved call
+
+# --- Privacy ---
+# True hides the windows from screen capture and screen sharing while leaving
+# them visible locally. Requires Windows 10 2004+.
+HIDE_FROM_SCREENSHARE: bool = False
+
 # --- Secrets ---
 GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
 

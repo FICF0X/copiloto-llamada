@@ -10,9 +10,10 @@ import json
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 
-from src.config import ROOT
+from src import config
 
-CONVERSATIONS_DIR = ROOT / "conversations"
+# Rebound rather than imported by value so tests can point the store elsewhere.
+CONVERSATIONS_DIR = config.CONVERSATIONS_DIR
 
 # Longest title kept in the sidebar list, in characters.
 TITLE_MAX = 60
