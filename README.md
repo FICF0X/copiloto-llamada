@@ -27,7 +27,11 @@ understanding.
    ```
    winget install Python.Python.3.12
    ```
-2. **Una API key de Gemini (gratis)** — créala en [Google AI Studio](https://aistudio.google.com). Es tu clave personal: cada persona necesita la suya.
+2. **Una API key de Gemini (gratis)** — es tu clave personal: cada persona necesita la suya. Cómo crearla:
+   1. Entra a [aistudio.google.com](https://aistudio.google.com) e inicia sesión con tu cuenta de Google.
+   2. Clic en **"Get API key"** (menú de la izquierda).
+   3. Clic en **"Create API key"** — es gratis, no pide tarjeta.
+   4. Copia la clave (empieza con `AIza...`); `run.bat` te la pedirá la primera vez.
 3. **Doble clic en `run.bat`** — la primera vez instala todo solo (tarda varios minutos) y te pide pegar tu API key. Las siguientes veces abre la app directo.
 
 > ⚠️ Descomprime el ZIP antes de ejecutar `run.bat` (clic derecho → *Extraer todo*). No lo ejecutes desde dentro del ZIP.
