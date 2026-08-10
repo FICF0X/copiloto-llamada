@@ -54,7 +54,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from src import conversations, theme
+from src import config, conversations, theme
 from src.audio_capture import list_loopback_devices
 from src.brain import Brain
 from src.config import (
@@ -64,6 +64,7 @@ from src.config import (
     HIDE_FROM_SCREENSHARE,
     LENGTH_FILE,
     MODE_FILE,
+    RESOURCES_ROOT,
     ROOT,
     USAGE_FILE,
 )
@@ -834,18 +835,60 @@ class ChatWindow(QWidget):
         self._build_ui()
         # Every edge/corner resizes, not just the QSizeGrip's bottom-right one.
         self._reposition_grips = _add_resize_grips(self)
-        self._start_model_loading()
+        # Deferred so the window is already on screen before anything (the API
+        # key dialog, then loading) starts — see _start_model_loading.
+        QTimer.singleShot(0, self._start_model_loading)
 
     # ------------------------------------------------------------- startup
     def _start_model_loading(self) -> None:
-        """Kick off the one-and-only background load of Whisper/Gemini/Argos."""
+        """Kick off the one-and-only background load of Whisper/Gemini/Argos.
+
+        A standalone build has no run.bat to ask for a Gemini key up front, so
+        this is also where a first run without one gets prompted — Brain()
+        would otherwise fail deep inside the background thread with nowhere
+        for the user to see why (pythonw has no console).
+        """
         if getattr(self, "_model_loader", None) is not None:
             return  # already loading (or loaded) — never start a second one
+        if not config.GEMINI_API_KEY and not self._prompt_for_api_key():
+            self.status_label.setText("Sin clave de Gemini")
+            self.close()  # same cleanup path as the user closing the window
+            return
         self._model_loader = ModelLoader()
         self._model_loader.status.connect(self.status_label.setText)
         self._model_loader.ready.connect(self._on_models_ready)
         self._model_loader.failed.connect(self._on_models_failed)
         self._model_loader.start()
+
+    def _prompt_for_api_key(self) -> bool:
+        """First run, no GEMINI_API_KEY anywhere: ask for one and save it.
+
+        Returns whether a key was entered. On success the key is already
+        live (config.set_api_key updates the running process too, not just
+        the .env file) so the caller can start loading right away.
+        """
+        key, ok = QInputDialog.getText(
+            self,
+            "Clave de Gemini",
+            "CallAssist necesita una clave de la API de Gemini para responder "
+            "preguntas. Es gratis: consíguela en aistudio.google.com "
+            "(“Get API key” → “Create API key”) y pégala aquí:",
+            # Masked: this app is meant to be open during a screen share, so a
+            # key echoed in plain text could be read by everyone on the call.
+            QLineEdit.Password,
+            "",
+        )
+        key = key.strip()
+        if not ok or not key:
+            QMessageBox.information(
+                self,
+                "CallAssist",
+                "Sin una clave de Gemini, CallAssist no puede responder "
+                "preguntas. Puedes volver a abrir la app cuando la tengas.",
+            )
+            return False
+        config.set_api_key(key)
+        return True
 
     def _on_models_ready(self, transcriber, brain, translator) -> None:
         self.transcriber = transcriber
@@ -1623,9 +1666,11 @@ def main() -> None:
 
     app = QApplication(sys.argv)
 
-    icon_path = ROOT / "assets" / "icon.ico"
+    # RESOURCES_ROOT, not ROOT: a bundled build's assets live wherever
+    # PyInstaller actually put them (sys._MEIPASS), not next to the .exe.
+    icon_path = RESOURCES_ROOT / "assets" / "icon.ico"
     if not icon_path.exists():
-        icon_path = ROOT / "assets" / "icon.png"
+        icon_path = RESOURCES_ROOT / "assets" / "icon.png"
     if icon_path.exists():
         app.setWindowIcon(QIcon(str(icon_path)))
 

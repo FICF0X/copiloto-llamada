@@ -10,13 +10,8 @@ from typing import Iterator
 from google import genai
 from google.genai import types
 
-from src.config import (
-    GEMINI_API_KEY,
-    GEMINI_MODEL,
-    GEMINI_TIMEOUT_MS,
-    MAX_HISTORY_MESSAGES,
-    validate,
-)
+from src import config
+from src.config import GEMINI_MODEL, GEMINI_TIMEOUT_MS, MAX_HISTORY_MESSAGES, validate
 
 SYSTEM_PROMPT = (
     "You are a real-time copilot helping the user answer questions during a live "
@@ -51,7 +46,11 @@ class Brain:
 
     def __init__(self) -> None:
         validate()  # fail fast if the API key is missing
-        self.client = genai.Client(api_key=GEMINI_API_KEY)
+        # Module attribute, not a `from ... import GEMINI_API_KEY` value: a key
+        # entered at runtime (first-run dialog, see chat_app._prompt_for_api_key)
+        # updates config.GEMINI_API_KEY after this module was already imported,
+        # and only an attribute lookup like this one picks that update up.
+        self.client = genai.Client(api_key=config.GEMINI_API_KEY)
         self.history: list[types.Content] = []  # rolling user/model turns
         self._context = ""  # static meeting briefing for this session
         self._length = "short"  # answer-length preference: "short" | "detailed"

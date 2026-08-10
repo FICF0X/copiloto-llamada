@@ -48,3 +48,9 @@ panel_geometry.txt
 conversations/
 composer_split.txt
 prompt_editor_geometry.txt
+
+# PyInstaller build output (see build_exe.bat / CallAssist.spec)
+build/
+dist/
+*.egg-info/
+*.zip

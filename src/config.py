@@ -2,12 +2,26 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
 
-# Project root = parent of the src/ folder.
-ROOT = Path(__file__).resolve().parent.parent
+if getattr(sys, "frozen", False):
+    # Running as a PyInstaller build: __file__ points into the bundle (a temp
+    # extraction dir, or the onedir app folder), which can be read-only or
+    # wiped between runs. Settings/.env must live somewhere that survives and
+    # is writable, so use the folder the .exe itself sits in.
+    ROOT = Path(sys.executable).resolve().parent
+    # Bundled read-only resources (e.g. assets/icon.ico) are NOT next to the
+    # .exe in onedir builds (they live under _internal/) — PyInstaller always
+    # points sys._MEIPASS at wherever it actually put them, for both onedir
+    # and onefile, so resource lookups must use this instead of ROOT.
+    RESOURCES_ROOT = Path(getattr(sys, "_MEIPASS", ROOT))
+else:
+    # Project root = parent of the src/ folder.
+    ROOT = Path(__file__).resolve().parent.parent
+    RESOURCES_ROOT = ROOT
 
 # Load variables from .env into the environment.
 load_dotenv(ROOT / ".env")
@@ -86,3 +100,38 @@ def validate() -> None:
             "GEMINI_API_KEY is empty. Create a .env file in the project root "
             "with: GEMINI_API_KEY=your_key"
         )
+
+
+def set_api_key(key: str) -> None:
+    """Save a Gemini API key entered at runtime (first-run prompt in the UI).
+
+    Updates this module's GEMINI_API_KEY (so `validate()` and anything reading
+    `config.GEMINI_API_KEY` see it immediately), the process environment (so a
+    plain os.getenv also sees it), and writes/updates .env next to ROOT so the
+    key survives the next launch too — the standalone build has no run.bat to
+    ask for it again.
+    """
+    global GEMINI_API_KEY
+    GEMINI_API_KEY = key
+    os.environ["GEMINI_API_KEY"] = key
+
+    try:
+        env_path = ROOT / ".env"
+        lines = (
+            env_path.read_text(encoding="utf-8").splitlines()
+            if env_path.exists()
+            else []
+        )
+        found = False
+        for i, line in enumerate(lines):
+            if line.strip().startswith("GEMINI_API_KEY="):
+                lines[i] = f"GEMINI_API_KEY={key}"
+                found = True
+                break
+        if not found:
+            lines.append(f"GEMINI_API_KEY={key}")
+        env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except OSError:
+        # Key still works for this session (env var + GEMINI_API_KEY above);
+        # it just won't survive a restart if ROOT isn't writable.
+        pass

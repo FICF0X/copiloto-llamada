@@ -21,7 +21,16 @@ understanding.
 
 ## 🇪🇸 Guía rápida en español
 
-¿Solo quieres usar la app? Necesitas tres cosas:
+**La forma más fácil: descarga el `.exe`.** En la sección
+[Releases](../../releases) está `CallAssist-win64.zip`: descomprímelo, abre
+`CallAssist.exe` y listo — no necesitas instalar Python ni nada más. La primera
+vez te pedirá tu API key de Gemini (paso 2 de abajo). Transcribe usando el
+procesador; si tienes una GPU NVIDIA y quieres máxima velocidad, usa el método
+manual de aquí abajo.
+
+### Método manual (desde el código)
+
+Necesitas tres cosas:
 
 1. **Python 3.12** — si no lo tienes, abre una terminal (tecla Windows → escribe `cmd` → Enter) y ejecuta:
    ```
@@ -248,7 +257,7 @@ All settings live in [`src/config.py`](src/config.py):
 - [x] Conversation memory across the call (with a New conversation reset)
 - [x] Live capture status + estimated daily request counter
 - [ ] Demo GIF / video in this README
-- [ ] Packaged `.exe` (PyInstaller) on a GitHub Release — run with no Python setup
+- [x] Packaged `.exe` (PyInstaller) — run with no Python setup
 - [ ] Selectable translation target language (beyond Spanish)
 - [ ] Multiple saved context profiles
 
