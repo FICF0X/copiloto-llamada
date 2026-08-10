@@ -19,6 +19,23 @@ understanding.
 
 ---
 
+## 🇪🇸 Guía rápida en español
+
+¿Solo quieres usar la app? Necesitas tres cosas:
+
+1. **Python 3.12** — si no lo tienes, abre una terminal (tecla Windows → escribe `cmd` → Enter) y ejecuta:
+   ```
+   winget install Python.Python.3.12
+   ```
+2. **Una API key de Gemini (gratis)** — créala en [Google AI Studio](https://aistudio.google.com). Es tu clave personal: cada persona necesita la suya.
+3. **Doble clic en `run.bat`** — la primera vez instala todo solo (tarda varios minutos) y te pide pegar tu API key. Las siguientes veces abre la app directo.
+
+> ⚠️ Descomprime el ZIP antes de ejecutar `run.bat` (clic derecho → *Extraer todo*). No lo ejecutes desde dentro del ZIP.
+
+Si algo falla, revisa la sección [Troubleshooting](#-troubleshooting) más abajo.
+
+---
+
 ## 🎬 Demo
 
 <!-- TODO: record a 15-20s GIF of the app catching a question and answering, save it to assets/demo.gif -->
