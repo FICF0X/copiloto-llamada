@@ -20,11 +20,14 @@ DEVICE_FILE = ROOT / "audio_device.txt"  # last chosen loopback device
 USAGE_FILE = ROOT / "usage.txt"  # estimated requests sent today
 MODE_FILE = ROOT / "listen_mode.txt"  # "auto" or "controlled"
 LENGTH_FILE = ROOT / "answer_length.txt"  # "short" or "detailed"
+HIDE_FILE = ROOT / "hide_from_screenshare.txt"  # "1" or "0", user toggle
 CONVERSATIONS_DIR = ROOT / "conversations"  # one JSON per saved call
 
 # --- Privacy ---
-# True hides the windows from screen capture and screen sharing while leaving
-# them visible locally. Requires Windows 10 2004+.
+# Default for the first run only (no HIDE_FILE saved yet). After that, the
+# "Ocultar al compartir pantalla" toggle in the chat window and HIDE_FILE are
+# the source of truth. True hides the windows from screen capture and screen
+# sharing while leaving them visible locally. Requires Windows 10 2004+.
 HIDE_FROM_SCREENSHARE: bool = False
 
 # --- Secrets ---

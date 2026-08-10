@@ -1,4 +1,4 @@
-"""Chat-style redesign of the copilot (prototype).
+"""Chat-style redesign of CallAssist (prototype).
 
 Two surfaces instead of one crowded overlay:
 
@@ -20,10 +20,11 @@ from __future__ import annotations
 import ctypes
 import sys
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtGui import (
     QColor,
     QFont,
+    QIcon,
     QKeySequence,
     QLinearGradient,
     QPainter,
@@ -59,6 +60,7 @@ from src.brain import Brain
 from src.config import (
     CONTEXT_FILE,
     DEVICE_FILE,
+    HIDE_FILE,
     HIDE_FROM_SCREENSHARE,
     LENGTH_FILE,
     MODE_FILE,
@@ -74,6 +76,7 @@ from src.worker import CopilotWorker
 # Windows: keep the window visible locally but absent from screen capture and
 # screen sharing. Requires Windows 10 2004+.
 WDA_EXCLUDEFROMCAPTURE = 0x00000011
+WDA_NONE = 0x00000000
 
 # Geometry of each surface, remembered separately: they are moved and sized for
 # different jobs (reading vs. glancing).
@@ -119,16 +122,105 @@ def _write_text(path, value: str) -> None:
         pass
 
 
+def _load_stealth_setting() -> bool:
+    """First run has no HIDE_FILE yet, so the config constant is the default."""
+    raw = _read_text(HIDE_FILE).strip()
+    if raw in ("1", "0"):
+        return raw == "1"
+    return HIDE_FROM_SCREENSHARE
+
+
+# Whether app windows are currently hidden from screen capture. Read once at
+# startup and flipped at runtime by the "Ocultar al compartir pantalla"
+# toggle; every window re-applies this value the moment it changes, and again
+# on its own showEvent so a window shown later still respects it.
+_stealth_enabled = _load_stealth_setting()
+
+
 def _apply_stealth(widget: QWidget) -> None:
-    """Hide the window from screen capture while keeping it visible locally."""
-    if not HIDE_FROM_SCREENSHARE or sys.platform != "win32":
+    """Hide (or restore) the window from screen capture, per the current toggle."""
+    if sys.platform != "win32":
         return
+    affinity = WDA_EXCLUDEFROMCAPTURE if _stealth_enabled else WDA_NONE
     try:
-        ctypes.windll.user32.SetWindowDisplayAffinity(
-            int(widget.winId()), WDA_EXCLUDEFROMCAPTURE
-        )
+        ctypes.windll.user32.SetWindowDisplayAffinity(int(widget.winId()), affinity)
     except Exception:  # noqa: BLE001 - stealth is best-effort
         pass
+
+
+def _apply_app_icon(widget: QWidget) -> None:
+    """Set this window's own icon explicitly.
+
+    QApplication.setWindowIcon() is supposed to reach every top-level widget,
+    but frameless/tool windows do not reliably pick it up for the taskbar —
+    setting it on the instance directly makes sure they do.
+    """
+    app = QApplication.instance()
+    if app is not None and not app.windowIcon().isNull():
+        widget.setWindowIcon(app.windowIcon())
+
+
+# --- Frameless resize -------------------------------------------------------
+# Frameless windows have no native resize border, so dragging their edges does
+# nothing by default. A grip widget per edge/corner hands off to the OS via
+# QWindow.startSystemResize the moment it is pressed — the same idea as the
+# QSizeGrip already used for the bottom-right corner, just covering every
+# edge instead of only one.
+RESIZE_MARGIN = 8
+
+_EDGE_CURSORS = {
+    Qt.LeftEdge: Qt.SizeHorCursor,
+    Qt.RightEdge: Qt.SizeHorCursor,
+    Qt.TopEdge: Qt.SizeVerCursor,
+    Qt.BottomEdge: Qt.SizeVerCursor,
+    Qt.TopEdge | Qt.LeftEdge: Qt.SizeFDiagCursor,
+    Qt.TopEdge | Qt.RightEdge: Qt.SizeBDiagCursor,
+    Qt.BottomEdge | Qt.LeftEdge: Qt.SizeBDiagCursor,
+    Qt.BottomEdge | Qt.RightEdge: Qt.SizeFDiagCursor,
+}
+
+
+class _ResizeGrip(QWidget):
+    """Invisible strip covering one edge or corner of a frameless window."""
+
+    def __init__(self, window: QWidget, edges: Qt.Edges) -> None:
+        super().__init__(window)
+        self._window = window
+        self._edges = edges
+        self.setCursor(_EDGE_CURSORS[edges])
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton:
+            handle = self._window.windowHandle()
+            if handle is not None:
+                handle.startSystemResize(self._edges)
+
+
+def _add_resize_grips(window: QWidget):
+    """Attach edge/corner grips to `window`; return a fn that repositions them.
+
+    Call the returned function from the window's resizeEvent so the grips
+    keep hugging the border as it grows or shrinks.
+    """
+    m = RESIZE_MARGIN
+    grips = [_ResizeGrip(window, edges) for edges in _EDGE_CURSORS]
+    left, right, top, bottom, tl, tr, bl, br = grips
+
+    def reposition() -> None:
+        w, h = window.width(), window.height()
+        left.setGeometry(0, m, m, max(h - 2 * m, 0))
+        right.setGeometry(w - m, m, m, max(h - 2 * m, 0))
+        top.setGeometry(m, 0, max(w - 2 * m, 0), m)
+        bottom.setGeometry(m, h - m, max(w - 2 * m, 0), m)
+        tl.setGeometry(0, 0, m, m)
+        tr.setGeometry(w - m, 0, m, m)
+        bl.setGeometry(0, h - m, m, m)
+        br.setGeometry(w - m, h - m, m, m)
+        for g in grips:
+            g.raise_()
+
+    reposition()
+    return reposition
 
 
 class ToggleSwitch(QCheckBox):
@@ -362,6 +454,7 @@ class LivePanel(QWidget):
             Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
         )
         self.setMinimumSize(320, 220)
+        _apply_app_icon(self)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -431,7 +524,7 @@ class LivePanel(QWidget):
         actions.addWidget(self.es_btn)
         lay.addLayout(actions)
 
-        # Resize handle: cheaper and more predictable than hit-testing the edges.
+        # Corner handle, kept alongside the full-border grips added below.
         grip_row = QHBoxLayout()
         grip_row.setContentsMargins(0, 0, 0, 0)
         grip_row.addStretch()
@@ -440,6 +533,9 @@ class LivePanel(QWidget):
 
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setStyleSheet(theme.panel_stylesheet())
+
+        # Every edge/corner resizes, not just the QSizeGrip's bottom-right one.
+        self._reposition_grips = _add_resize_grips(self)
 
         geo = _read_geometry(PANEL_GEOMETRY_FILE, PANEL_DEFAULT)
         self.setGeometry(*geo)
@@ -495,6 +591,12 @@ class LivePanel(QWidget):
         glass = theme.apply_glass(self, small_corners=True)
         self.setStyleSheet(theme.panel_stylesheet(own_corners=not glass))
         _apply_stealth(self)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        reposition = getattr(self, "_reposition_grips", None)
+        if reposition is not None:
+            reposition()
 
     def closeEvent(self, event) -> None:
         _write_geometry(PANEL_GEOMETRY_FILE, self)
@@ -594,6 +696,7 @@ class PromptEditor(QDialog):
         super().showEvent(event)
         glass = theme.apply_glass(self)
         self.setStyleSheet(theme.stylesheet(own_corners=not glass))
+        _apply_stealth(self)
         self.editor.setFocus()
 
     def closeEvent(self, event) -> None:
@@ -601,21 +704,105 @@ class PromptEditor(QDialog):
         super().closeEvent(event)
 
 
+class SettingsPopover(QWidget):
+    """Small popover for app-wide settings, opened from the ⚙ button.
+
+    A flat list of rows so more settings can be dropped in later without new
+    scaffolding: each row is just a label, its tooltip and a ToggleSwitch.
+    """
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent, Qt.Popup)
+        self.setObjectName("settingspopover")
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setFixedWidth(280)
+        self.setStyleSheet(
+            theme.stylesheet()
+            + f"""
+            #settingspopover {{
+                background-color: {theme.GLASS_BASE};
+                border: 1px solid {theme.STROKE};
+                border-radius: {theme.RADIUS_MD}px;
+            }}
+            """
+        )
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 12, 14, 12)
+        lay.setSpacing(10)
+
+        header = QHBoxLayout()
+        title = QLabel("Configuración")
+        title.setObjectName("sectionlabel")
+        header.addWidget(title)
+        header.addStretch()
+        close_btn = QPushButton("✕")
+        close_btn.setObjectName("closebtn")
+        close_btn.setFixedSize(20, 20)
+        close_btn.setCursor(Qt.PointingHandCursor)
+        close_btn.clicked.connect(self.hide)
+        header.addWidget(close_btn)
+        lay.addLayout(header)
+
+        self._rows = QVBoxLayout()
+        self._rows.setSpacing(10)
+        lay.addLayout(self._rows)
+
+    def add_toggle_row(self, label_text: str, tooltip: str, checked: bool) -> ToggleSwitch:
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        label = QLabel(label_text)
+        label.setObjectName("chiplabel")
+        label.setWordWrap(True)
+        label.setToolTip(tooltip)
+        switch = ToggleSwitch()
+        switch.setChecked(checked)
+        switch.setToolTip(tooltip)
+        row.addWidget(label, stretch=1)
+        row.addWidget(switch)
+        self._rows.addLayout(row)
+        return switch
+
+
+class ModelLoader(QThread):
+    """Constructs Whisper, Gemini and Argos off the GUI thread.
+
+    Building these synchronously in main() is what used to stall the window
+    from appearing at all. Same idiom as CopilotWorker: no return value, just
+    signals, so the window never touches the models until they exist.
+    """
+
+    status = Signal(str)
+    ready = Signal(object, object, object)  # transcriber, brain, translator
+    failed = Signal(str)
+
+    def run(self) -> None:
+        try:
+            self.status.emit("Cargando modelo de voz (puede tardar unos segundos)...")
+            transcriber = Transcriber()
+            self.status.emit("Conectando con Gemini...")
+            brain = Brain()
+            self.status.emit("Preparando traductor offline...")
+            translator = Translator()
+        except Exception as exc:  # noqa: BLE001 - surfaced in the UI, not a hidden console
+            self.failed.emit(str(exc))
+            return
+        self.ready.emit(transcriber, brain, translator)
+
+
 class ChatWindow(QWidget):
     """Setup and full transcript. The Live panel takes over during the call."""
 
-    def __init__(
-        self,
-        transcriber: Transcriber,
-        brain: Brain,
-        translator: Translator,
-        usage: UsageTracker,
-    ) -> None:
+    def __init__(self) -> None:
         super().__init__()
-        self.transcriber = transcriber
-        self.brain = brain
-        self.translator = translator
-        self.usage = usage
+        # Whisper/Gemini/Argos load in the background (see _start_model_loading)
+        # so the window can show right away; every call site that needs them
+        # must check _models_loaded (or that brain/etc. isn't None) first.
+        self.transcriber: Transcriber | None = None
+        self.brain: Brain | None = None
+        self.translator: Translator | None = None
+        self._models_loaded = False
+        self.usage = UsageTracker(USAGE_FILE)  # a path + a tiny text file, cheap enough
         self.worker: CopilotWorker | None = None
         # The conversation being recorded right now. Each one is independent: a
         # new chat never inherits the previous chat's memory.
@@ -624,8 +811,7 @@ class ChatWindow(QWidget):
         # is on screen. Reading an old call never revives it.
         self._viewing: str | None = None
 
-        self._answer_length = self._load_length()
-        self.brain.set_length(self._answer_length)
+        self._answer_length = self._load_length()  # applied to `brain` once it exists
         self._processing_secs = 0
         self._processing_timer = QTimer(self)
         self._processing_timer.timeout.connect(self._tick_processing)
@@ -644,11 +830,46 @@ class ChatWindow(QWidget):
         self.panel.cancel_requested.connect(self._cancel_send)
         self.panel.closed.connect(self._close_panel)
 
+        _apply_app_icon(self)
         self._build_ui()
+        # Every edge/corner resizes, not just the QSizeGrip's bottom-right one.
+        self._reposition_grips = _add_resize_grips(self)
+        self._start_model_loading()
+
+    # ------------------------------------------------------------- startup
+    def _start_model_loading(self) -> None:
+        """Kick off the one-and-only background load of Whisper/Gemini/Argos."""
+        if getattr(self, "_model_loader", None) is not None:
+            return  # already loading (or loaded) — never start a second one
+        self._model_loader = ModelLoader()
+        self._model_loader.status.connect(self.status_label.setText)
+        self._model_loader.ready.connect(self._on_models_ready)
+        self._model_loader.failed.connect(self._on_models_failed)
+        self._model_loader.start()
+
+    def _on_models_ready(self, transcriber, brain, translator) -> None:
+        self.transcriber = transcriber
+        self.brain = brain
+        self.translator = translator
+        self._models_loaded = True
+        self.brain.set_length(self._answer_length)
+        self.status_label.setText("Listo")
+        self.listen_btn.setEnabled(True)
+
+    def _on_models_failed(self, message: str) -> None:
+        self.status_label.setText("⚠️ Error al cargar los modelos")
+        QMessageBox.critical(
+            self,
+            "Error al cargar",
+            "No se pudieron cargar los modelos de voz/IA:\n\n"
+            f"{message}\n\n"
+            "Revisa el README (sección de solución de problemas) si falta "
+            "CUDA o la GEMINI_API_KEY.",
+        )
 
     # ---------------------------------------------------------------- UI
     def _build_ui(self) -> None:
-        self.setWindowTitle("Copiloto")
+        self.setWindowTitle("CallAssist")
         self.setMinimumSize(900, 580)
         # Frameless so the acrylic backdrop and the rounded shell are ours to
         # define; Windows still supplies the drop shadow and corner rounding.
@@ -757,14 +978,38 @@ class ChatWindow(QWidget):
         lay.setContentsMargins(theme.SPACE_LG, 0, theme.SPACE_SM, 0)
         lay.setSpacing(theme.SPACE_SM)
 
-        brand = QLabel("◈  Copiloto")
+        brand_row = QHBoxLayout()
+        brand_row.setSpacing(8)
+        brand_icon = QLabel()
+        app = QApplication.instance()
+        app_icon = app.windowIcon() if app is not None else QIcon()
+        if not app_icon.isNull():
+            # Real icon once assets/icon.ico exists; the glyph is only a
+            # fallback for a checkout that hasn't added it yet.
+            brand_icon.setPixmap(app_icon.pixmap(18, 18))
+        else:
+            brand_icon.setText("◈")
+        brand_row.addWidget(brand_icon)
+        brand = QLabel("CallAssist")
         brand.setObjectName("brand")
-        lay.addWidget(brand)
+        brand_row.addWidget(brand)
+        lay.addLayout(brand_row)
         lay.addStretch()
 
-        self.status_label = QLabel("Listo")
+        # Overwritten almost immediately by ModelLoader's own status signal;
+        # this is just what's on screen for the instant before that arrives.
+        self.status_label = QLabel("Cargando modelo de voz…")
         self.status_label.setObjectName("status")
         lay.addWidget(self.status_label)
+
+        self._build_settings_popover()
+        self.gear_btn = QPushButton("⚙")
+        self.gear_btn.setObjectName("windowbtn")
+        self.gear_btn.setFixedSize(32, 28)
+        self.gear_btn.setCursor(Qt.PointingHandCursor)
+        self.gear_btn.setToolTip("Configuración")
+        self.gear_btn.clicked.connect(self._open_settings)
+        lay.addWidget(self.gear_btn)
 
         for glyph, tip, slot, name in (
             ("─", "Minimizar", self.showMinimized, "windowbtn"),
@@ -778,6 +1023,26 @@ class ChatWindow(QWidget):
             button.clicked.connect(slot)
             lay.addWidget(button)
         return header
+
+    def _build_settings_popover(self) -> None:
+        """App-wide settings, reached from the ⚙ button (see _open_settings)."""
+        self.settings_popover = SettingsPopover(self)
+        stealth_tip = (
+            "Las ventanas de la app no se verán cuando compartas pantalla "
+            "(tú sí las ves)."
+        )
+        self.stealth_switch = self.settings_popover.add_toggle_row(
+            "Ocultar al compartir pantalla", stealth_tip, _stealth_enabled
+        )
+        self.stealth_switch.toggled.connect(self._on_stealth_toggled)
+
+    def _open_settings(self) -> None:
+        pos = self.gear_btn.mapToGlobal(self.gear_btn.rect().bottomRight())
+        self.settings_popover.adjustSize()
+        self.settings_popover.move(
+            pos.x() - self.settings_popover.width(), pos.y() + 6
+        )
+        self.settings_popover.show()
 
     def _build_main(self) -> QWidget:
         main = QWidget()
@@ -888,9 +1153,11 @@ class ChatWindow(QWidget):
         self.listen_btn.setObjectName("primary")
         self.listen_btn.setFixedHeight(42)
         self.listen_btn.setCursor(Qt.PointingHandCursor)
+        self.listen_btn.setEnabled(False)  # enabled once _on_models_ready fires
         self.listen_btn.clicked.connect(self._toggle)
         action_row.addWidget(self.listen_btn, stretch=1)
-        # Resize handle for the frameless shell, tucked beside the main action.
+        # Corner handle, tucked beside the main action; the full-border grips
+        # added in __init__ cover the rest of the window's edges.
         action_row.addWidget(QSizeGrip(self), 0, Qt.AlignBottom | Qt.AlignRight)
         clay.addLayout(action_row)
 
@@ -912,8 +1179,11 @@ class ChatWindow(QWidget):
             text = dialog.text()
             self.context_box.setPlainText(text)
             _write_text(CONTEXT_FILE, text)
-            # A running call picks up the edit on its next question.
-            self.brain.set_context(text)
+            # A running call picks up the edit on its next question. No-op while
+            # the models are still loading — _start_listening reads the box
+            # fresh anyway once they're ready, so nothing is lost.
+            if self.brain is not None:
+                self.brain.set_context(text)
 
     def _load_split(self) -> list[int]:
         try:
@@ -972,7 +1242,10 @@ class ChatWindow(QWidget):
 
     def _on_length_toggled(self, detailed: bool) -> None:
         self._answer_length = "detailed" if detailed else "short"
-        self.brain.set_length(self._answer_length)
+        # No-op while loading; _on_models_ready applies self._answer_length
+        # once `brain` exists.
+        if self.brain is not None:
+            self.brain.set_length(self._answer_length)
         _write_text(LENGTH_FILE, self._answer_length)
         self._update_length_hint()
 
@@ -980,6 +1253,15 @@ class ChatWindow(QWidget):
         self.length_hint.setText(
             "Detalladas" if self._answer_length == "detailed" else "Cortas"
         )
+
+    def _on_stealth_toggled(self, hidden: bool) -> None:
+        # Module-level: shared with LivePanel's own showEvent, so a panel
+        # shown later (or the panel already on screen) reflects it too.
+        global _stealth_enabled
+        _stealth_enabled = hidden
+        _write_text(HIDE_FILE, "1" if hidden else "0")
+        _apply_stealth(self)
+        _apply_stealth(self.panel)
 
     # ------------------------------------------------------------- control
     def _toggle(self) -> None:
@@ -994,6 +1276,8 @@ class ChatWindow(QWidget):
             self._start_listening()
 
     def _start_listening(self) -> None:
+        if not self._models_loaded:
+            return  # Whisper/Gemini/Argos not ready yet; listen_btn is disabled too
         if self.worker and self.worker.isRunning():
             return
         # Listening while reading an old call opens a new one instead of
@@ -1291,7 +1575,9 @@ class ChatWindow(QWidget):
         conversations.save(self.convo)  # no-op when it has no exchanges
         self.convo = conversations.new_conversation(context)
         self._viewing = None
-        self.brain.reset(context)  # each chat starts with no memory, by design
+        # No-op while loading — there is no memory to reset yet.
+        if self.brain is not None:
+            self.brain.reset(context)  # each chat starts with no memory, by design
         self.chat.clear()
         self._refresh_history_list()
         self._refresh_recents()
@@ -1306,6 +1592,13 @@ class ChatWindow(QWidget):
         # only round in CSS when it did not, so the two never fight over corners.
         glass = theme.apply_glass(self)
         self.setStyleSheet(theme.stylesheet(own_corners=not glass))
+        _apply_stealth(self)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        reposition = getattr(self, "_reposition_grips", None)
+        if reposition is not None:
+            reposition()
 
     def closeEvent(self, event) -> None:
         _write_geometry(CHAT_GEOMETRY_FILE, self)
@@ -1317,19 +1610,31 @@ class ChatWindow(QWidget):
 
 
 def main() -> None:
+    if sys.platform == "win32":
+        # Must run before QApplication exists: it tells Windows this process
+        # is its own app, so the taskbar uses our icon (set below) instead of
+        # grouping it under the generic python.exe one.
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "FICF0X.CallAssist"
+            )
+        except Exception:  # noqa: BLE001 - taskbar grouping is best-effort
+            pass
+
     app = QApplication(sys.argv)
 
-    print("Cargando modelo de transcripcion (puede tardar unos segundos)...")
-    transcriber = Transcriber()
-    print(f"[OK] Whisper en: {transcriber.device}")
-    brain = Brain()
-    print("[OK] Gemini listo.")
-    print("Preparando traductor offline...")
-    translator = Translator()
-    print(f"[OK] Traductor offline listo: {translator.ready}. Abriendo ventana...")
+    icon_path = ROOT / "assets" / "icon.ico"
+    if not icon_path.exists():
+        icon_path = ROOT / "assets" / "icon.png"
+    if icon_path.exists():
+        app.setWindowIcon(QIcon(str(icon_path)))
 
-    usage = UsageTracker(USAGE_FILE)
-    window = ChatWindow(transcriber, brain, translator, usage)
+    # Whisper/Gemini/Argos are heavy (GPU model load, network clients) and used
+    # to be built here, blocking the window from appearing until all three were
+    # ready. ChatWindow now shows immediately and loads them itself in the
+    # background (see ModelLoader) — the status label carries what these prints
+    # used to say, since pythonw has no console for them to go to anyway.
+    window = ChatWindow()
     window.show()
     sys.exit(app.exec())
 

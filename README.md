@@ -1,6 +1,6 @@
-# 🎧 Copiloto de Llamada
+# 🎧 CallAssist
 
-> Real-time AI copilot that listens to your call, understands the questions, and streams you an answer to say — live.
+> Real-time AI assistant that listens to your call, understands the questions, and streams you an answer to say — live.
 
 A desktop app for Windows that captures your **system audio** (what plays through your
 speakers), transcribes speech **locally on the GPU**, detects when the other person
@@ -32,7 +32,7 @@ understanding.
    2. Clic en **"Get API key"** (menú de la izquierda).
    3. Clic en **"Create API key"** — es gratis, no pide tarjeta.
    4. Copia la clave (empieza con `AIza...`); `run.bat` te la pedirá la primera vez.
-3. **Doble clic en `run.bat`** — la primera vez instala todo solo (tarda varios minutos) y te pide pegar tu API key. Las siguientes veces abre la app directo.
+3. **Doble clic en `run.bat`** — la primera vez instala todo solo (tarda varios minutos) y te pide pegar tu API key. Al terminar crea un acceso directo **"CallAssist"** en tu escritorio: a partir de ahí abre la app desde ese ícono, sin ventana negra.
 
 > ⚠️ Descomprime el ZIP antes de ejecutar `run.bat` (clic derecho → *Extraer todo*). No lo ejecutes desde dentro del ZIP.
 
@@ -164,7 +164,8 @@ GEMINI_API_KEY=your_key_here
 python -m src.chat_app
 ```
 
-Or double-click `run.bat`.
+Or double-click `run.bat` — on first run it also drops a **"CallAssist"** desktop
+shortcut that launches the app with no console window (`pythonw.exe`).
 
 The app has two surfaces, each doing one job.
 

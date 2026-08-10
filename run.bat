@@ -34,8 +34,8 @@ if "%GEMINI_KEY%"=="" goto check_env
 echo GEMINI_API_KEY=%GEMINI_KEY%> .env
 
 :run
-.venv\Scripts\python.exe -m src.chat_app
-pause
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\make_shortcut.ps1" "%~dp0" >nul 2>&1
+start "" ".venv\Scripts\pythonw.exe" -m src.chat_app
 exit /b
 
 :no_python
