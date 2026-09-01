@@ -83,6 +83,7 @@ PANEL_GEOMETRY_FILE = ROOT / "panel_geometry.txt"
 # room for stays roomy on the next launch.
 SPLIT_FILE = ROOT / "composer_split.txt"
 EDITOR_GEOMETRY_FILE = ROOT / "prompt_editor_geometry.txt"
+PRESET_EDITOR_GEOMETRY_FILE = ROOT / "preset_editor_geometry.txt"
 
 PANEL_DEFAULT = (60, 60, 460, 340)
 
@@ -713,6 +714,401 @@ class PromptEditor(QDialog):
         super().closeEvent(event)
 
 
+class PresetForm(QDialog):
+    """Small modal collecting a preset's name, context and answer language.
+
+    Used for both "Nuevo preset" and "Editar preset" - the only difference
+    is whether the fields start blank and what `on_submit` does with them.
+    `on_submit`, when given, is called from accept() with (label, context,
+    answer_language) and must return the created/updated
+    src.presets.Preset or raise src.presets.ValidationError. On a
+    ValidationError the dialog shows the message and stays open with
+    whatever the user already typed - it does NOT close and force a retype,
+    unlike PromptEditor's plain accept/reject (there is nothing to validate
+    there).
+    """
+
+    def __init__(
+        self,
+        parent: QWidget,
+        title: str,
+        label: str = "",
+        context: str = "",
+        answer_language: str = "en",
+        on_submit=None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Dialog)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setModal(True)
+        self.setMinimumSize(480, 380)
+        self._on_submit = on_submit
+        self.result_value = None  # the Preset returned by on_submit on success
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        shell = QWidget()
+        shell.setObjectName("shell")
+        outer.addWidget(shell)
+
+        lay = QVBoxLayout(shell)
+        lay.setContentsMargins(
+            theme.SPACE_LG, theme.SPACE_SM, theme.SPACE_LG, theme.SPACE_LG
+        )
+        lay.setSpacing(theme.SPACE_MD)
+
+        header = DragBar(self)
+        header.setFixedHeight(38)
+        hlay = QHBoxLayout(header)
+        hlay.setContentsMargins(0, 0, 0, 0)
+        title_label = QLabel(title)
+        title_label.setObjectName("brand")
+        hlay.addWidget(title_label)
+        hlay.addStretch()
+        close_btn = QPushButton("✕")
+        close_btn.setObjectName("closebtn")
+        close_btn.setFixedSize(32, 28)
+        close_btn.setCursor(Qt.PointingHandCursor)
+        close_btn.clicked.connect(self.reject)
+        hlay.addWidget(close_btn)
+        lay.addWidget(header)
+
+        name_label = QLabel("Nombre")
+        name_label.setObjectName("sectionlabel")
+        lay.addWidget(name_label)
+        self.label_edit = QLineEdit(label)
+        self.label_edit.setObjectName("search")
+        self.label_edit.setPlaceholderText("Ej: Llamada de ventas")
+        lay.addWidget(self.label_edit)
+
+        lang_row = QHBoxLayout()
+        lang_row.setSpacing(theme.SPACE_SM)
+        lang_label = QLabel("Idioma de la respuesta")
+        lang_label.setObjectName("sectionlabel")
+        lang_row.addWidget(lang_label)
+        lang_row.addStretch()
+        self.lang_combo = QComboBox()
+        self.lang_combo.setObjectName("chip")
+        self.lang_combo.setEditable(True)
+        self.lang_combo.addItems(["en", "es"])
+        self.lang_combo.setToolTip(
+            "Código de idioma (en, es, ...) en el que responde la IA con este preset"
+        )
+        idx = self.lang_combo.findText(answer_language)
+        if idx >= 0:
+            self.lang_combo.setCurrentIndex(idx)
+        else:
+            self.lang_combo.setCurrentText(answer_language)
+        lang_row.addWidget(self.lang_combo)
+        lay.addLayout(lang_row)
+
+        ctx_label = QLabel("Contexto / rol")
+        ctx_label.setObjectName("sectionlabel")
+        lay.addWidget(ctx_label)
+        self.context_edit = QTextEdit()
+        self.context_edit.setObjectName("contextbox")
+        self.context_edit.setFont(QFont("Segoe UI Variable Text", theme.PT_BODY))
+        self.context_edit.setPlainText(context)
+        self.context_edit.setPlaceholderText(
+            "Qué rol cumple la IA y cómo debe responder con este preset."
+        )
+        lay.addWidget(self.context_edit, stretch=1)
+
+        footer = QHBoxLayout()
+        footer.setSpacing(theme.SPACE_SM)
+        footer.addStretch()
+        cancel_btn = QPushButton("Cancelar")
+        cancel_btn.setObjectName("ghost")
+        cancel_btn.setFixedHeight(36)
+        cancel_btn.setCursor(Qt.PointingHandCursor)
+        cancel_btn.clicked.connect(self.reject)
+        save_btn = QPushButton("Guardar")
+        save_btn.setObjectName("primary")
+        save_btn.setFixedHeight(36)
+        save_btn.setCursor(Qt.PointingHandCursor)
+        save_btn.setDefault(True)
+        save_btn.clicked.connect(self.accept)
+        footer.addWidget(cancel_btn)
+        footer.addWidget(save_btn)
+        lay.addLayout(footer)
+
+    def label(self) -> str:
+        return self.label_edit.text()
+
+    def context(self) -> str:
+        return self.context_edit.toPlainText()
+
+    def answer_language(self) -> str:
+        return self.lang_combo.currentText().strip()
+
+    def accept(self) -> None:
+        if self._on_submit is not None:
+            try:
+                self.result_value = self._on_submit(
+                    self.label(), self.context(), self.answer_language()
+                )
+            except (presets.ValidationError, presets.StorageError) as exc:
+                QMessageBox.warning(self, "Revisa el preset", str(exc))
+                return  # keep the dialog open with whatever was typed
+        super().accept()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        glass = theme.apply_glass(self)
+        self.setStyleSheet(theme.stylesheet(own_corners=not glass))
+        _apply_stealth(self)
+        self.label_edit.setFocus()
+
+
+class PresetEditor(QDialog):
+    """Full CRUD over the prompt library (src/presets.py), opened from the
+    "✎" button next to the composer's preset combo.
+
+    List-and-actions, not a single form + OK: every action (create, rename/
+    edit, duplicate, delete, restore factory presets) persists immediately
+    through src/presets.py's module-level functions - same idiom as
+    SettingsPopover's toggles. "Cerrar" only closes the window; there is no
+    separate save step to forget, matching the spec's "Create and use
+    immediately" scenario.
+    """
+
+    def __init__(
+        self, parent: QWidget, store: list, active_preset_id: str
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Dialog)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setModal(True)
+        self.setMinimumSize(520, 440)
+
+        # Local working copy: src.presets' create/update/duplicate/delete/
+        # restore_factory_presets mutate-and-save this exact list, so it
+        # always mirrors what's on disk the instant an action succeeds.
+        self.store = list(store)
+        # Starts as whatever preset was active when the dialog opened; only
+        # changes if the user deletes that exact preset (spec: "Deleting the
+        # active preset falls back safely" -> falls back to General, i.e. "").
+        self.active_preset_id = active_preset_id
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        shell = QWidget()
+        shell.setObjectName("shell")
+        outer.addWidget(shell)
+
+        lay = QVBoxLayout(shell)
+        lay.setContentsMargins(
+            theme.SPACE_LG, theme.SPACE_SM, theme.SPACE_LG, theme.SPACE_LG
+        )
+        lay.setSpacing(theme.SPACE_MD)
+
+        header = DragBar(self)
+        header.setFixedHeight(38)
+        hlay = QHBoxLayout(header)
+        hlay.setContentsMargins(0, 0, 0, 0)
+        title = QLabel("Editar presets")
+        title.setObjectName("brand")
+        hlay.addWidget(title)
+        hlay.addStretch()
+        close_btn = QPushButton("✕")
+        close_btn.setObjectName("closebtn")
+        close_btn.setFixedSize(32, 28)
+        close_btn.setCursor(Qt.PointingHandCursor)
+        close_btn.clicked.connect(self.accept)
+        hlay.addWidget(close_btn)
+        lay.addWidget(header)
+
+        hint = QLabel(
+            "Cada preset es un rol + idioma de respuesta. \"Fábrica\" es solo "
+            "una etiqueta: todos los presets se pueden editar y borrar."
+        )
+        hint.setObjectName("chiplabel")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+
+        self.list_widget = QListWidget()
+        self.list_widget.setObjectName("historylist")
+        self.list_widget.itemSelectionChanged.connect(self._update_button_states)
+        self.list_widget.itemDoubleClicked.connect(lambda _item: self._on_edit())
+        lay.addWidget(self.list_widget, stretch=1)
+
+        actions = QHBoxLayout()
+        actions.setSpacing(theme.SPACE_SM)
+        self.new_btn = QPushButton("＋ Nuevo")
+        self.new_btn.setObjectName("ghost")
+        self.new_btn.setCursor(Qt.PointingHandCursor)
+        self.new_btn.clicked.connect(self._on_new)
+        self.edit_btn = QPushButton("✎ Editar")
+        self.edit_btn.setObjectName("ghost")
+        self.edit_btn.setCursor(Qt.PointingHandCursor)
+        self.edit_btn.clicked.connect(self._on_edit)
+        self.duplicate_btn = QPushButton("⧉ Duplicar")
+        self.duplicate_btn.setObjectName("ghost")
+        self.duplicate_btn.setCursor(Qt.PointingHandCursor)
+        self.duplicate_btn.clicked.connect(self._on_duplicate)
+        self.delete_btn = QPushButton("🗑 Borrar")
+        self.delete_btn.setObjectName("ghost")
+        self.delete_btn.setCursor(Qt.PointingHandCursor)
+        self.delete_btn.clicked.connect(self._on_delete)
+        actions.addWidget(self.new_btn)
+        actions.addWidget(self.edit_btn)
+        actions.addWidget(self.duplicate_btn)
+        actions.addWidget(self.delete_btn)
+        actions.addStretch()
+        lay.addLayout(actions)
+
+        footer = QHBoxLayout()
+        footer.setSpacing(theme.SPACE_SM)
+        self.restore_btn = QPushButton("↺ Restaurar presets de fábrica")
+        self.restore_btn.setObjectName("ghost")
+        self.restore_btn.setCursor(Qt.PointingHandCursor)
+        self.restore_btn.setToolTip(
+            "Vuelve a agregar General/Interview/University si los borraste. "
+            "Nunca sobrescribe uno que editaste y conservaste."
+        )
+        self.restore_btn.clicked.connect(self._on_restore_factory)
+        footer.addWidget(self.restore_btn)
+        footer.addStretch()
+        close_action_btn = QPushButton("Cerrar")
+        close_action_btn.setObjectName("primary")
+        close_action_btn.setFixedHeight(36)
+        close_action_btn.setCursor(Qt.PointingHandCursor)
+        close_action_btn.clicked.connect(self.accept)
+        footer.addWidget(close_action_btn)
+        lay.addLayout(footer)
+
+        self._reload()
+        geo = _read_geometry(PRESET_EDITOR_GEOMETRY_FILE, (0, 0, 640, 520))
+        self.resize(geo[2], geo[3])
+
+    # --- List rendering -----------------------------------------------------
+    def _reload(self, select_id: str | None = None) -> None:
+        select_id = select_id or self._selected_id()
+        self.list_widget.clear()
+        for preset in self.store:
+            badge = " · fábrica" if preset.builtin else ""
+            item = QListWidgetItem(f"{preset.label}{badge}")
+            item.setData(Qt.UserRole, preset.id)
+            self.list_widget.addItem(item)
+            if preset.id == select_id:
+                self.list_widget.setCurrentItem(item)
+        if self.list_widget.currentItem() is None and self.list_widget.count():
+            self.list_widget.setCurrentRow(0)
+        self._update_button_states()
+
+    def _selected_id(self) -> str | None:
+        item = self.list_widget.currentItem()
+        return item.data(Qt.UserRole) if item is not None else None
+
+    def _selected_preset(self):
+        preset_id = self._selected_id()
+        if preset_id is None:
+            return None
+        return next((p for p in self.store if p.id == preset_id), None)
+
+    def _update_button_states(self) -> None:
+        has_selection = self._selected_id() is not None
+        self.edit_btn.setEnabled(has_selection)
+        self.duplicate_btn.setEnabled(has_selection)
+        # `builtin` never blocks delete - only "would this be the last
+        # preset" does (spec: "Deleting the last preset is prevented").
+        self.delete_btn.setEnabled(has_selection and len(self.store) > 1)
+
+    # --- Actions --------------------------------------------------------
+    def _on_new(self) -> None:
+        form = PresetForm(
+            self,
+            "Nuevo preset",
+            on_submit=lambda label, context, lang: presets.create(
+                label, context, lang, self.store
+            ),
+        )
+        if form.exec() == QDialog.Accepted and form.result_value is not None:
+            self._reload(select_id=form.result_value.id)
+
+    def _on_edit(self) -> None:
+        preset = self._selected_preset()
+        if preset is None:
+            return
+        preset_id = preset.id
+        form = PresetForm(
+            self,
+            "Editar preset",
+            label=preset.label,
+            context=preset.context,
+            answer_language=preset.answer_language,
+            on_submit=lambda label, context, lang: presets.update(
+                preset_id, label, context, lang, self.store
+            ),
+        )
+        if form.exec() == QDialog.Accepted:
+            self._reload(select_id=preset_id)
+
+    def _on_duplicate(self) -> None:
+        preset = self._selected_preset()
+        if preset is None:
+            return
+        try:
+            copy = presets.duplicate(preset.id, self.store)
+        except (presets.ValidationError, presets.StorageError) as exc:
+            QMessageBox.warning(self, "No se pudo duplicar", str(exc))
+            return
+        self._reload(select_id=copy.id)
+
+    def _on_delete(self) -> None:
+        preset = self._selected_preset()
+        if preset is None:
+            return
+        confirm = QMessageBox(self)
+        confirm.setWindowTitle("Borrar preset")
+        confirm.setText(f"¿Borrar «{preset.label}»?")
+        confirm.setInformativeText("Esto no se puede deshacer.")
+        confirm.setIcon(QMessageBox.Warning)
+        confirm.setStandardButtons(QMessageBox.Cancel | QMessageBox.Yes)
+        confirm.setDefaultButton(QMessageBox.Cancel)
+        confirm.button(QMessageBox.Yes).setText("Borrar")
+        confirm.button(QMessageBox.Cancel).setText("Cancelar")
+        if confirm.exec() != QMessageBox.Yes:
+            return
+
+        try:
+            self.store = presets.delete(preset.id, self.store)
+        except (presets.ValidationError, presets.StorageError) as exc:
+            QMessageBox.warning(self, "No se pudo borrar", str(exc))
+            return
+
+        if preset.id == self.active_preset_id:
+            # spec: "Deleting the active preset falls back safely" - reassign
+            # to General ("" resolves there via presets.find) and say so.
+            self.active_preset_id = ""
+            QMessageBox.information(
+                self,
+                "Preset activo eliminado",
+                f"«{preset.label}» era el preset activo. Se cambió a General.",
+            )
+        self._reload()
+
+    def _on_restore_factory(self) -> None:
+        self.store = presets.restore_factory_presets(self.store)
+        self._reload()
+        QMessageBox.information(
+            self,
+            "Presets de fábrica",
+            "Se restauraron los presets de fábrica que faltaban. Los que "
+            "editaste y conservaste no se tocaron.",
+        )
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        glass = theme.apply_glass(self)
+        self.setStyleSheet(theme.stylesheet(own_corners=not glass))
+        _apply_stealth(self)
+
+    def closeEvent(self, event) -> None:
+        _write_geometry(PRESET_EDITOR_GEOMETRY_FILE, self)
+        super().closeEvent(event)
+
+
 class SettingsPopover(QWidget):
     """Small popover for app-wide settings, opened from the ⚙ button.
 
@@ -1170,8 +1566,8 @@ class ChatWindow(QWidget):
         chips.setSpacing(8)
 
         # Preset combo: which role prompt + answer language the AI uses.
-        # READ-ONLY in this slice - selecting a preset works, but creating,
-        # editing or deleting one is the editor dialog (slice 5).
+        # Full create/rename/duplicate/delete/restore lives in the editor
+        # dialog opened by the button right next to it (slice 5).
         self.preset_combo = QComboBox()
         self.preset_combo.setObjectName("chip")
         self.preset_combo.setToolTip(
@@ -1179,6 +1575,13 @@ class ChatWindow(QWidget):
         )
         self._populate_presets()
         self.preset_combo.currentIndexChanged.connect(self._on_preset_changed)
+
+        self.edit_presets_btn = QPushButton("✎")
+        self.edit_presets_btn.setObjectName("ghost")
+        self.edit_presets_btn.setFixedSize(32, 30)
+        self.edit_presets_btn.setCursor(Qt.PointingHandCursor)
+        self.edit_presets_btn.setToolTip("Editar presets: crear, renombrar, duplicar o borrar")
+        self.edit_presets_btn.clicked.connect(self._open_preset_editor)
 
         self.device_combo = QComboBox()
         self.device_combo.setObjectName("chip")
@@ -1211,6 +1614,7 @@ class ChatWindow(QWidget):
         self.length_hint.setObjectName("chiplabel")
 
         chips.addWidget(self.preset_combo, stretch=2)
+        chips.addWidget(self.edit_presets_btn)
         chips.addWidget(self.device_combo, stretch=2)
         chips.addWidget(self.mode_combo, stretch=1)
         chips.addStretch()
@@ -1294,15 +1698,22 @@ class ChatWindow(QWidget):
     def _populate_presets(self) -> None:
         """Fill the preset combo from self.presets, selecting the active one.
 
-        READ-ONLY: this only lists what's already in self.presets. Creating,
-        editing, duplicating or deleting a preset is the editor (slice 5),
-        which will need to reload self.presets and call this again.
+        Only lists what's already in self.presets - the editor dialog
+        (_open_preset_editor) reloads self.presets after any create/rename/
+        duplicate/delete/restore and calls this again to refresh the combo.
         """
         self.preset_combo.blockSignals(True)
         self.preset_combo.clear()
         active = presets.find(self.settings.preset_id, self.presets)
+        # find() can hand back a stand-in General when the real one was
+        # deleted. It is the preset actually in effect, so it has to appear
+        # in the list; otherwise the combo would highlight an unrelated row
+        # and tell the user something untrue about the next call.
+        listed = list(self.presets)
+        if all(preset.id != active.id for preset in listed):
+            listed.insert(0, active)
         selected = 0
-        for i, preset in enumerate(self.presets):
+        for i, preset in enumerate(listed):
             self.preset_combo.addItem(preset.label, preset.id)
             if preset.id == active.id:
                 selected = i
@@ -1319,6 +1730,25 @@ class ChatWindow(QWidget):
     def _on_preset_changed(self, _index: int) -> None:
         preset = self._selected_preset()
         self._set("preset_id", preset.id)
+
+    def _open_preset_editor(self) -> None:
+        """Open the full CRUD editor over the prompt library.
+
+        Idle-only, same as the combo itself: the button is disabled while a
+        call is in progress (see _start_listening/_on_worker_finished), so
+        this is never reachable mid-call.
+        """
+        dialog = PresetEditor(self, self.presets, self.settings.preset_id)
+        dialog.exec()
+        # The dialog mutates its own working copy and persists every action
+        # immediately (create/rename/duplicate/delete/restore), so once it
+        # closes self.presets just needs to catch up to what's on disk.
+        self.presets = presets.load()
+        if dialog.active_preset_id != self.settings.preset_id:
+            # Only happens when the user deleted the preset that was active:
+            # PresetEditor already fell back to "" (resolves to General).
+            self._set("preset_id", dialog.active_preset_id)
+        self._populate_presets()
 
     def _populate_devices(self) -> None:
         self.device_combo.clear()
@@ -1441,6 +1871,7 @@ class ChatWindow(QWidget):
         # once at start(), so a switch mid-call would change the label
         # without changing a single answer.
         self.preset_combo.setEnabled(False)
+        self.edit_presets_btn.setEnabled(False)
         self.listen_btn.setText(
             "■  Enviar y responder" if mode == "controlled" else "■  Detener"
         )
@@ -1498,6 +1929,7 @@ class ChatWindow(QWidget):
         self._processing = False
         self.mode_combo.setEnabled(True)
         self.preset_combo.setEnabled(True)
+        self.edit_presets_btn.setEnabled(True)
         self.listen_btn.setEnabled(True)
         self.listen_btn.setText("●  Escuchar la llamada")
         self.panel.set_done()

@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from src import presets
 
 
@@ -184,7 +186,15 @@ def test_corrupt_presets_json_is_quarantined_and_reseeded(isolated_presets):
     assert {p.label for p in rows} == {"General", "Interview", "University (Spanish)"}
 
 
-def test_write_swallows_oserror_on_read_only_root(isolated_presets, monkeypatch):
+def test_a_failed_write_is_reported_instead_of_silently_losing_the_preset(
+    isolated_presets, monkeypatch
+):
+    """Settings can swallow a failed write; presets cannot.
+
+    A preset holds prompt text the user typed. If the editor closed as if it
+    had saved, the work would simply be gone at the next launch with nothing
+    ever having said so.
+    """
     from pathlib import Path
 
     def _raise_oserror(self, *args, **kwargs):
@@ -192,7 +202,26 @@ def test_write_swallows_oserror_on_read_only_root(isolated_presets, monkeypatch)
 
     monkeypatch.setattr(Path, "write_text", _raise_oserror)
 
-    presets.save([presets.Preset(id="x", label="won't persist, but won't crash")])
+    with pytest.raises(presets.StorageError):
+        presets.save([presets.Preset(id="x", label="hand-written preset")])
+
+
+def test_a_duplicated_label_never_exceeds_the_length_the_editor_accepts(
+    isolated_presets,
+):
+    """The generated copy name obeys the same cap a typed one does.
+
+    Otherwise duplicating a long-named preset produces a row that saves fine
+    and then refuses to be edited, for a rule the user never broke.
+    """
+    long_label = "P" * (presets.MAX_LABEL_LENGTH - 2)
+    store = presets.load()
+    original = presets.create(long_label, "context", "en", store)
+
+    copy = presets.duplicate(original.id, presets.load())
+
+    assert len(copy.label) <= presets.MAX_LABEL_LENGTH
+    presets.update(copy.id, copy.label, "edited", "en", presets.load())
 
 
 # --- find() resolution --------------------------------------------------
@@ -263,3 +292,252 @@ def test_the_stand_in_general_keeps_a_stable_identity(isolated_presets):
 
     assert first.factory_id == "general"
     assert first.id == second.id
+
+
+# --- Slice 5: full CRUD (create/update/duplicate/delete/restore) -----------
+# Traces spec's preset-editor domain scenarios: "Create and use immediately",
+# "Empty name blocked", "Duplicate rename blocked", "Last preset delete
+# blocked", "Restore after editing a factory preset". Deleting-the-active-
+# preset's fallback lives in chat_app.py (settings.preset_id is Qt-adjacent
+# state this module never touches) and is not covered here - see the manual
+# checklist in apply-progress.
+
+
+def test_create_validates_and_persists(isolated_presets):
+    rows = presets.load()
+    created = presets.create("Sales Call", "Be persuasive.", "en", rows)
+
+    assert created.label == "Sales Call"
+    assert created.factory_id == ""
+    assert created.builtin is False
+    reloaded = presets.load()
+    assert any(p.id == created.id for p in reloaded)
+
+
+def test_create_rejects_empty_name(isolated_presets):
+    rows = presets.load()
+    try:
+        presets.create("   ", "some context", "en", rows)
+        assert False, "expected ValidationError"
+    except presets.ValidationError:
+        pass
+    assert len(presets.load()) == 3  # nothing was created or persisted
+
+
+def test_create_rejects_empty_context(isolated_presets):
+    rows = presets.load()
+    try:
+        presets.create("Sales Call", "   ", "en", rows)
+        assert False, "expected ValidationError"
+    except presets.ValidationError:
+        pass
+    assert len(presets.load()) == 3
+
+
+def test_create_rejects_duplicate_name_case_insensitive(isolated_presets):
+    rows = presets.load()
+    try:
+        presets.create("interview", "some context", "en", rows)
+        assert False, "expected ValidationError"
+    except presets.ValidationError:
+        pass
+
+
+def test_create_rejects_name_over_length_bound(isolated_presets):
+    rows = presets.load()
+    try:
+        presets.create("x" * (presets.MAX_LABEL_LENGTH + 1), "context", "en", rows)
+        assert False, "expected ValidationError"
+    except presets.ValidationError:
+        pass
+
+
+def test_update_renames_and_keeps_identity(isolated_presets):
+    rows = presets.load()
+    general = presets.find("", rows)
+    original_id = general.id
+
+    updated = presets.update(
+        original_id, "General (mío)", "New context", "en", rows
+    )
+
+    assert updated.id == original_id  # spec: rename never changes identity
+    reloaded = presets.load()
+    renamed = presets.find(original_id, reloaded)
+    assert renamed.label == "General (mío)"
+    assert renamed.context == "New context"
+    assert renamed.id == original_id
+
+
+def test_update_rejects_rename_to_existing_name(isolated_presets):
+    """spec: "Duplicate rename blocked" - renaming University to Interview
+    is rejected and University keeps its name."""
+    rows = presets.load()
+    interview = next(p for p in rows if p.factory_id == "interview")
+    university = next(p for p in rows if p.factory_id == "university")
+
+    try:
+        presets.update(
+            university.id, interview.label, university.context, "es", rows
+        )
+        assert False, "expected ValidationError"
+    except presets.ValidationError:
+        pass
+
+    reloaded = presets.load()
+    still_university = presets.find(university.id, reloaded)
+    assert still_university.label == "University (Spanish)"
+
+
+def test_update_allows_keeping_its_own_name(isolated_presets):
+    """Renaming a preset to the SAME name it already has must not be treated
+    as a collision with itself."""
+    rows = presets.load()
+    general = presets.find("", rows)
+
+    updated = presets.update(general.id, general.label, "New context", "en", rows)
+
+    assert updated.label == general.label
+    assert updated.context == "New context"
+
+
+def test_update_rejects_unknown_id(isolated_presets):
+    rows = presets.load()
+    try:
+        presets.update("does-not-exist", "Name", "context", "en", rows)
+        assert False, "expected ValidationError"
+    except presets.ValidationError:
+        pass
+
+
+def test_duplicate_creates_independent_user_owned_copy(isolated_presets):
+    rows = presets.load()
+    interview = next(p for p in rows if p.factory_id == "interview")
+
+    copy = presets.duplicate(interview.id, rows)
+
+    assert copy.id != interview.id
+    assert copy.factory_id == ""  # never itself a factory row
+    assert copy.builtin is False
+    assert copy.context == interview.context
+    assert copy.answer_language == interview.answer_language
+    assert copy.label != interview.label  # auto-disambiguated
+    reloaded = presets.load()
+    assert len(reloaded) == 4
+
+
+def test_duplicate_twice_gets_distinct_labels(isolated_presets):
+    """Duplicating the same preset repeatedly must never collide - it's an
+    automated action, the user never typed a name for it."""
+    rows = presets.load()
+    interview = next(p for p in rows if p.factory_id == "interview")
+
+    first_copy = presets.duplicate(interview.id, rows)
+    second_copy = presets.duplicate(interview.id, rows)
+
+    assert first_copy.label != second_copy.label
+
+
+def test_duplicate_rejects_unknown_id(isolated_presets):
+    rows = presets.load()
+    try:
+        presets.duplicate("does-not-exist", rows)
+        assert False, "expected ValidationError"
+    except presets.ValidationError:
+        pass
+
+
+def test_delete_removes_and_persists(isolated_presets):
+    rows = presets.load()
+    interview = next(p for p in rows if p.factory_id == "interview")
+
+    survivors = presets.delete(interview.id, rows)
+
+    assert {p.factory_id for p in survivors} == {"general", "university"}
+    reloaded = presets.load()
+    assert {p.factory_id for p in reloaded} == {"general", "university"}
+
+
+def test_delete_last_remaining_preset_is_blocked(isolated_presets):
+    """spec: "Deleting the last preset is prevented"."""
+    rows = [presets.Preset(id="only-one", label="Only One", context="x")]
+    presets.save(rows)
+
+    try:
+        presets.delete("only-one", rows)
+        assert False, "expected ValidationError"
+    except presets.ValidationError:
+        pass
+
+    reloaded = presets.load()
+    assert len(reloaded) == 1
+    assert reloaded[0].id == "only-one"
+
+
+def test_delete_unknown_id_is_rejected_without_mutating_the_store(isolated_presets):
+    rows = presets.load()
+    try:
+        presets.delete("does-not-exist", rows)
+        assert False, "expected ValidationError"
+    except presets.ValidationError:
+        pass
+    assert len(presets.load()) == 3
+
+
+def test_builtin_preset_is_fully_editable_and_deletable(isolated_presets):
+    """`builtin` drives an editor badge, never a permission (design PINNED
+    DECISION 2) - a factory preset goes through create/update/duplicate/
+    delete with no special-casing whatsoever."""
+    rows = presets.load()
+    general = presets.find("", rows)
+    assert general.builtin is True
+
+    presets.update(general.id, "General (edited)", "edited context", "fr", rows)
+    reloaded = presets.load()
+    edited = presets.find(general.id, reloaded)
+    assert edited.label == "General (edited)"
+    assert edited.builtin is True  # still flagged as originally factory-seeded
+
+    survivors = presets.delete(general.id, reloaded)
+    assert all(p.id != general.id for p in survivors)
+
+
+def test_restore_factory_presets_readds_only_missing_rows(isolated_presets):
+    """spec: "Restore after editing a factory preset" - General was edited
+    and Interview was deleted; restoring reverts General to nothing (it was
+    only edited, not removed) while bringing Interview back, and never
+    touches user-created presets."""
+    rows = presets.load()
+    general = presets.find("", rows)
+    general.label = "General (edited by user)"
+    general.context = "user's own context"
+    without_interview = [p for p in rows if p.factory_id != "interview"]
+    presets.save(without_interview)
+    presets.create("My Own Preset", "user content", "en", without_interview)
+
+    restored = presets.restore_factory_presets(without_interview)
+
+    factory_ids = {p.factory_id for p in restored if p.factory_id}
+    assert factory_ids == {"general", "interview", "university"}
+    # General was edited but KEPT, so restore must not overwrite it.
+    still_edited_general = next(p for p in restored if p.factory_id == "general")
+    assert still_edited_general.label == "General (edited by user)"
+    assert still_edited_general.context == "user's own context"
+    # Interview was deleted, so restore re-adds a fresh factory copy.
+    readded_interview = next(p for p in restored if p.factory_id == "interview")
+    assert readded_interview.builtin is True
+    assert readded_interview.context != ""
+    # User-created preset is untouched.
+    assert any(p.label == "My Own Preset" for p in restored)
+
+
+def test_restore_factory_presets_is_idempotent(isolated_presets):
+    rows = presets.load()
+    without_any_factory = [p for p in rows if not p.factory_id]  # empty list
+
+    first = presets.restore_factory_presets(without_any_factory)
+    second = presets.restore_factory_presets(first)
+
+    assert {p.factory_id for p in second} == {"general", "interview", "university"}
+    assert len(second) == 3  # no duplicate rows on the second call
+    assert [p.id for p in first] == [p.id for p in second]

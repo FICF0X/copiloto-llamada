@@ -168,8 +168,17 @@ def _seed() -> list[Preset]:
     return presets
 
 
+class StorageError(RuntimeError):
+    """The presets file could not be written."""
+
+
 def save(presets: list[Preset]) -> None:
-    """Write the whole presets document. Never raises on a read-only ROOT.
+    """Write the whole presets document.
+
+    Raises StorageError when the write fails. Settings can afford to swallow
+    that — a lost toggle costs one click — but a preset holds prompt text the
+    user wrote by hand. Closing the editor as if it saved and losing the work
+    at the next launch is the one outcome worth interrupting them for.
 
     Atomic write, the same pattern as settings.save(): the payload goes to a
     temp file in the same directory, then os.replace swaps it in — readers
@@ -184,11 +193,14 @@ def save(presets: list[Preset]) -> None:
     try:
         tmp_path.write_text(payload, encoding="utf-8")
         os.replace(tmp_path, PRESETS_FILE)
-    except OSError:
+    except OSError as exc:
         try:
             tmp_path.unlink(missing_ok=True)
         except OSError:
             pass
+        raise StorageError(
+            f"No se pudo guardar los presets: {exc}"
+        ) from exc
 
 
 def _quarantine_corrupt_file() -> None:
@@ -237,3 +249,185 @@ def translate_target(preset: Preset, translator_target: str) -> str:
     already answers in target language").
     """
     return "" if preset.answer_language == translator_target else translator_target
+
+
+# --- Full CRUD (slice 5: the preset editor) ---------------------------------
+#
+# `builtin`/`factory_id` are provenance/badge data ONLY. Every function below
+# treats a factory-seeded preset exactly like a user-created one: it can be
+# renamed, edited, duplicated and deleted with no special-casing. That is the
+# "every preset is editable and deletable" must-hold from design PINNED
+# DECISION 2 - there is deliberately no `if preset.builtin: raise` anywhere
+# in this section.
+
+MAX_LABEL_LENGTH = 80
+# Generous, not strict: the design note is explicit that answer QUALITY is
+# the user's to own, so this bound exists only to keep a combo item and a
+# JSON file sane, never to second-guess how much context someone needs.
+MAX_CONTEXT_LENGTH = 6000
+
+
+class ValidationError(ValueError):
+    """User-facing preset validation failure (empty name, empty context,
+    duplicate name, or a length bound). The message is written to be shown
+    to the user as-is by the editor dialog - never a stack trace, never a
+    dev-facing string."""
+
+
+def _clean_label(label: str) -> str:
+    label = (label or "").strip()
+    if not label:
+        raise ValidationError("El nombre no puede estar vacío.")
+    if len(label) > MAX_LABEL_LENGTH:
+        raise ValidationError(
+            f"El nombre no puede superar los {MAX_LABEL_LENGTH} caracteres."
+        )
+    return label
+
+
+def _clean_context(context: str) -> str:
+    context = (context or "").strip()
+    if not context:
+        raise ValidationError("El contexto no puede estar vacío.")
+    if len(context) > MAX_CONTEXT_LENGTH:
+        raise ValidationError(
+            f"El contexto no puede superar los {MAX_CONTEXT_LENGTH} caracteres."
+        )
+    return context
+
+
+def _label_taken(label: str, presets: list[Preset], *, exclude_id: str = "") -> bool:
+    """Case-insensitive collision check (spec: "reject renaming to a name
+    duplicating another existing preset (case-insensitive)"). Applied to
+    create() too - not just rename - so the combo never shows two presets
+    a user can't tell apart by label; `id` remains the only real identity,
+    this is purely about not confusing the human reading the combo."""
+    needle = label.casefold()
+    return any(
+        p.id != exclude_id and p.label.strip().casefold() == needle for p in presets
+    )
+
+
+def create(
+    label: str, context: str, answer_language: str, presets: list[Preset]
+) -> Preset:
+    """Validate and append a brand-new, user-owned preset. Mutates and saves
+    `presets` in place; returns the created row (its `id` is what the editor
+    selects next). Spec: "Create and use immediately"."""
+    label = _clean_label(label)
+    context = _clean_context(context)
+    if _label_taken(label, presets):
+        raise ValidationError(f"Ya existe un preset llamado «{label}».")
+    preset = Preset(
+        id=_new_id(),
+        factory_id="",
+        label=label,
+        context=context,
+        answer_language=(answer_language or "en").strip() or "en",
+        builtin=False,
+    )
+    presets.append(preset)
+    save(presets)
+    return preset
+
+
+def update(
+    preset_id: str,
+    label: str,
+    context: str,
+    answer_language: str,
+    presets: list[Preset],
+) -> Preset:
+    """Validate and edit an existing preset IN PLACE - `id`, `factory_id` and
+    `builtin` are never touched, so identity survives a rename (spec:
+    "Rename never changes identity") and a factory preset that gets edited
+    stays exactly as editable/deletable as before."""
+    preset = next((p for p in presets if p.id == preset_id), None)
+    if preset is None:
+        raise ValidationError("Ese preset ya no existe.")
+    label = _clean_label(label)
+    context = _clean_context(context)
+    if _label_taken(label, presets, exclude_id=preset_id):
+        raise ValidationError(f"Ya existe un preset llamado «{label}».")
+    preset.label = label
+    preset.context = context
+    preset.answer_language = (answer_language or "en").strip() or "en"
+    save(presets)
+    return preset
+
+
+def _unique_copy_label(base_label: str, presets: list[Preset]) -> str:
+    """Auto-disambiguate a duplicate's label so duplicating never needs user
+    input and never collides - this is an automated action, not typed text,
+    so it earns its own name rather than raising ValidationError."""
+    def fit(suffix: str) -> str:
+        # The generated label has to satisfy the same cap a typed one does:
+        # an over-long copy would save fine and then refuse to be edited.
+        room = MAX_LABEL_LENGTH - len(suffix)
+        return f"{base_label[:room].rstrip()}{suffix}"
+
+    candidate = fit(" (copia)")
+    n = 2
+    while _label_taken(candidate, presets):
+        candidate = fit(f" (copia {n})")
+        n += 1
+    return candidate
+
+
+def duplicate(preset_id: str, presets: list[Preset]) -> Preset:
+    """Copy a preset into a new, independent, user-owned row.
+
+    The copy is ALWAYS `factory_id=""`/`builtin=False`, even when duplicating
+    a factory preset - a duplicate is never itself a factory row, so
+    `restore_factory_presets()` never touches it and deleting the original
+    later never takes the copy down with it.
+    """
+    source = next((p for p in presets if p.id == preset_id), None)
+    if source is None:
+        raise ValidationError("Ese preset ya no existe.")
+    copy = Preset(
+        id=_new_id(),
+        factory_id="",
+        label=_unique_copy_label(source.label, presets),
+        engine_kind=source.engine_kind,
+        context=source.context,
+        answer_language=source.answer_language,
+        builtin=False,
+    )
+    presets.append(copy)
+    save(presets)
+    return copy
+
+
+def delete(preset_id: str, presets: list[Preset]) -> list[Preset]:
+    """Remove a preset and persist the result. Every preset is deletable -
+    `builtin` is a badge, never a permission - but the LAST remaining preset
+    can never be removed (spec: "Deleting the last preset is prevented"),
+    because the app always needs at least one row for `find()` to resolve
+    to. Reassigning the active preset when it's the one being deleted is the
+    caller's job (chat_app.py owns settings.preset_id, not this module).
+    """
+    if len(presets) <= 1:
+        raise ValidationError("No puedes borrar el último preset.")
+    survivors = [p for p in presets if p.id != preset_id]
+    if len(survivors) == len(presets):
+        raise ValidationError("Ese preset ya no existe.")
+    save(survivors)
+    return survivors
+
+
+def restore_factory_presets(presets: list[Preset]) -> list[Preset]:
+    """Re-add any factory preset whose `factory_id` is missing from the
+    store. NEVER overwrites a factory preset the user edited but kept -
+    presence is checked by `factory_id` alone, the row's current label or
+    context is never compared or touched (design PINNED DECISION 2:
+    "never overwrites a factory preset the user has edited but kept.
+    Idempotent."). Calling this twice in a row is a no-op the second time.
+    """
+    present = {p.factory_id for p in presets if p.factory_id}
+    restored = list(presets)
+    for defn in _FACTORY_DEFS:
+        if defn["factory_id"] not in present:
+            restored.append(_factory_preset(defn))
+    save(restored)
+    return restored
