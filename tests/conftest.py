@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import pytest
 
-from src import config, settings
+from src import config, presets, settings
 
 
 @pytest.fixture
@@ -29,4 +29,12 @@ def isolated_settings(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "LENGTH_FILE", tmp_path / "answer_length.txt")
     monkeypatch.setattr(config, "HIDE_FILE", tmp_path / "hide_from_screenshare.txt")
     monkeypatch.setattr(settings, "SETTINGS_FILE", tmp_path / "settings.json")
+    return tmp_path
+
+
+@pytest.fixture
+def isolated_presets(tmp_path, monkeypatch):
+    """Point presets.PRESETS_FILE at tmp_path. The file is not created - a
+    test that wants the seeded factory rows calls presets.load() itself."""
+    monkeypatch.setattr(presets, "PRESETS_FILE", tmp_path / "presets.json")
     return tmp_path

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 
-from src import config, settings
+from src import config, presets, settings
 
 
 def _write(path, text: str) -> None:
@@ -196,3 +196,40 @@ def test_load_validates_answer_length_like_the_legacy_migration_does(isolated_se
     loaded = settings.load()
     assert loaded.answer_length == "short"
     assert loaded.listen_mode == "controlled"
+
+
+# --- preset_id resolution (task 4.6) ----------------------------------------
+#
+# settings.py itself does not know about presets.py (settings-store stays
+# blast-radius-separated from the prompt library - PINNED DECISION 2). These
+# tests exercise the seam where the two meet: settings.Settings.preset_id is
+# just a stored string; presets.find() is what turns it into a real Preset.
+
+
+def test_fresh_install_preset_id_is_empty_and_resolves_to_general(
+    isolated_settings, isolated_presets
+):
+    s = settings.load()
+    assert s.preset_id == ""  # a v1.0.0 user's migrated settings.json too
+
+    active = presets.find(s.preset_id, presets.load())
+
+    assert active.factory_id == "general"
+    assert active.context == ""
+    assert active.answer_language == "en"
+
+
+def test_stored_preset_id_resolves_to_the_matching_preset(
+    isolated_settings, isolated_presets
+):
+    rows = presets.load()
+    university = next(p for p in rows if p.factory_id == "university")
+
+    s = settings.Settings(preset_id=university.id)
+    settings.save(s)
+
+    reloaded = settings.load()
+    active = presets.find(reloaded.preset_id, presets.load())
+
+    assert active.id == university.id
+    assert active.answer_language == "es"

@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import ctypes
 import sys
-from types import SimpleNamespace
 
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtGui import (
@@ -55,7 +54,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from src import config, conversations, settings, theme
+from src import config, conversations, presets, settings, theme
 from src.audio_source import list_devices
 from src.brain import Brain
 from src.config import (
@@ -86,12 +85,6 @@ SPLIT_FILE = ROOT / "composer_split.txt"
 EDITOR_GEOMETRY_FILE = ROOT / "prompt_editor_geometry.txt"
 
 PANEL_DEFAULT = (60, 60, 460, 340)
-
-# Implicit "General" preset, used only in this slice: src/presets.py (slice 4)
-# will replace this with a real Preset loaded from presets.json. Reproduces
-# v1.0.0 exactly - context="", answer_language="en" - per the design's
-# byte-identical-v1.0.0 regression requirement.
-_GENERAL_PRESET = SimpleNamespace(id="general", context="", answer_language="en")
 
 
 def _read_geometry(path, fallback: tuple[int, int, int, int] | None = None):
@@ -831,6 +824,11 @@ class ChatWindow(QWidget):
         # from for the whole window's lifetime, written through on every
         # change via _set().
         self.settings = settings.load()
+        # presets.json (the prompt library). Loaded once here, same as
+        # settings; this slice's combo is read-only, so self.presets is
+        # never mutated in-place - it is re-read only if the process
+        # restarts. The editor (slice 5) will need to refresh it in place.
+        self.presets = presets.load()
 
         self._answer_length = self._load_length()  # applied to `brain` once it exists
         self._processing_secs = 0
@@ -1171,6 +1169,17 @@ class ChatWindow(QWidget):
         chips = QHBoxLayout()
         chips.setSpacing(8)
 
+        # Preset combo: which role prompt + answer language the AI uses.
+        # READ-ONLY in this slice - selecting a preset works, but creating,
+        # editing or deleting one is the editor dialog (slice 5).
+        self.preset_combo = QComboBox()
+        self.preset_combo.setObjectName("chip")
+        self.preset_combo.setToolTip(
+            "Preset activo: el rol y el idioma en que responde la IA"
+        )
+        self._populate_presets()
+        self.preset_combo.currentIndexChanged.connect(self._on_preset_changed)
+
         self.device_combo = QComboBox()
         self.device_combo.setObjectName("chip")
         self.device_combo.setToolTip("Qué salida de audio escuchar")
@@ -1201,6 +1210,7 @@ class ChatWindow(QWidget):
         self.length_hint = QLabel("Cortas")
         self.length_hint.setObjectName("chiplabel")
 
+        chips.addWidget(self.preset_combo, stretch=2)
         chips.addWidget(self.device_combo, stretch=2)
         chips.addWidget(self.mode_combo, stretch=1)
         chips.addStretch()
@@ -1280,6 +1290,35 @@ class ChatWindow(QWidget):
 
     def _selected_device(self) -> dict | None:
         return self.device_combo.currentData()
+
+    def _populate_presets(self) -> None:
+        """Fill the preset combo from self.presets, selecting the active one.
+
+        READ-ONLY: this only lists what's already in self.presets. Creating,
+        editing, duplicating or deleting a preset is the editor (slice 5),
+        which will need to reload self.presets and call this again.
+        """
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.clear()
+        active = presets.find(self.settings.preset_id, self.presets)
+        selected = 0
+        for i, preset in enumerate(self.presets):
+            self.preset_combo.addItem(preset.label, preset.id)
+            if preset.id == active.id:
+                selected = i
+        self.preset_combo.setCurrentIndex(selected)
+        self.preset_combo.blockSignals(False)
+
+    def _selected_preset(self):
+        """The active src.presets.Preset, resolved the same way find() would
+        resolve settings.preset_id - so an empty/stale combo selection (e.g.
+        before _populate_presets ever ran) still lands on General."""
+        preset_id = self.preset_combo.currentData() or self.settings.preset_id
+        return presets.find(preset_id, self.presets)
+
+    def _on_preset_changed(self, _index: int) -> None:
+        preset = self._selected_preset()
+        self._set("preset_id", preset.id)
 
     def _populate_devices(self) -> None:
         self.device_combo.clear()
@@ -1369,9 +1408,19 @@ class ChatWindow(QWidget):
         listener = Listener(
             self.transcriber, device_index=device["index"] if device else None
         )
+        active_preset = self._selected_preset()
         strategy = AssistantStrategy(
-            _GENERAL_PRESET, self.brain, self.translator, self.usage,
-            translate_answer_to="es",
+            active_preset, self.brain, self.translator, self.usage,
+            # No double translation: skip Argos entirely when the preset's
+            # own answer language already equals the configured translator
+            # target (spec: "No double translation when preset already
+            # answers in target language"). For an unmodified install this
+            # still resolves to "es" - General answers in English and
+            # settings.translator_target defaults to "es" - so v1.0.0's
+            # hardcoded "es" behavior is unchanged.
+            translate_answer_to=presets.translate_target(
+                active_preset, self.settings.translator_target
+            ),
         )
         self.worker = CopilotWorker(listener, strategy, mode)
         self.worker.utterance_detected.connect(self._on_utterance)
@@ -1388,6 +1437,10 @@ class ChatWindow(QWidget):
         self._processing = False
         self._send_cancelled = False
         self.mode_combo.setEnabled(False)
+        # Idle-only, like the capture mode: the strategy reads its preset
+        # once at start(), so a switch mid-call would change the label
+        # without changing a single answer.
+        self.preset_combo.setEnabled(False)
         self.listen_btn.setText(
             "■  Enviar y responder" if mode == "controlled" else "■  Detener"
         )
@@ -1444,6 +1497,7 @@ class ChatWindow(QWidget):
         self._processing_timer.stop()
         self._processing = False
         self.mode_combo.setEnabled(True)
+        self.preset_combo.setEnabled(True)
         self.listen_btn.setEnabled(True)
         self.listen_btn.setText("●  Escuchar la llamada")
         self.panel.set_done()

@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from src import prompting
+from src import presets, prompting
 
 FIXTURES = Path(__file__).parent / "fixtures"
 GOLDEN = json.loads((FIXTURES / "golden_prompts_v1.json").read_text(encoding="utf-8"))
@@ -95,3 +95,37 @@ def test_empty_preset_context_reproduces_v1_with_call_context_only():
 def test_both_contexts_blank_omits_meeting_context_block():
     result = prompting.compose_system_instruction("  ", "  ", "en", "short")
     assert "MEETING CONTEXT (the topic and how the user wants to answer):" not in result
+
+
+# --- Real "University" factory preset composes a Spanish-answering prompt
+# (task 4.3): integration between presets.py's factory definition and
+# prompting.compose_system_instruction, not just the pure-string unit tests
+# above. ----------------------------------------------------------------
+
+
+def test_university_preset_composes_spanish_answer_rule(isolated_presets):
+    rows = presets.load()
+    university = next(p for p in rows if p.factory_id == "university")
+
+    result = prompting.compose_system_instruction(
+        university.context, "", university.answer_language, "short"
+    )
+
+    assert "- ALWAYS reply in Spanish, no matter what." in result
+    assert "- ALWAYS reply in English, no matter what." not in result
+    # The preset's own role prompt must land in the MEETING CONTEXT block.
+    assert university.context.strip() in result
+
+
+def test_general_preset_composes_byte_identical_to_v1_golden(isolated_presets):
+    """The other half of "General reproduces v1.0.0": not just the pure
+    compose_system_instruction unit test, but the real seeded preset's own
+    fields fed through it."""
+    rows = presets.load()
+    general = presets.find("", rows)
+
+    result = prompting.compose_system_instruction(
+        general.context, "", general.answer_language, "short"
+    )
+
+    assert result == GOLDEN["short_no_context"]

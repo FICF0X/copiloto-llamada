@@ -12,12 +12,13 @@ installed.
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from src.engines.base import EngineCallbacks, EngineResult, Utterance
 
 if TYPE_CHECKING:  # pragma: no cover - type-only, never imported at runtime
     from src.brain import Brain
+    from src.presets import Preset
     from src.translator import Translator
     from src.usage import UsageTracker
 
@@ -25,16 +26,18 @@ if TYPE_CHECKING:  # pragma: no cover - type-only, never imported at runtime
 class AssistantStrategy:
     """Transcribed utterance -> streamed Gemini answer -> offline ES translation.
 
-    `preset` is duck-typed (reads only `.context` and `.answer_language`) so
-    this module needs no import of src.presets, which does not exist yet in
-    this slice. Slice 4 wires in the real Preset without changing this class.
+    `preset` is still duck-typed (reads only `.context` and
+    `.answer_language` via getattr, never isinstance) even though slice 4
+    wires in a real `src.presets.Preset` — this class needs no import of
+    src.presets at runtime, and stays trivially fakeable with a
+    SimpleNamespace in tests.
     """
 
     kind = "assistant"
 
     def __init__(
         self,
-        preset: Any,
+        preset: "Preset",
         brain: "Brain",
         translator: "Translator",
         usage: "UsageTracker",
