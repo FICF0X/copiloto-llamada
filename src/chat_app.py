@@ -54,16 +54,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from src import config, conversations, theme
+from src import config, conversations, settings, theme
 from src.audio_capture import list_loopback_devices
 from src.brain import Brain
 from src.config import (
-    CONTEXT_FILE,
-    DEVICE_FILE,
-    HIDE_FILE,
     HIDE_FROM_SCREENSHARE,
-    LENGTH_FILE,
-    MODE_FILE,
     RESOURCES_ROOT,
     ROOT,
     USAGE_FILE,
@@ -124,11 +119,9 @@ def _write_text(path, value: str) -> None:
 
 
 def _load_stealth_setting() -> bool:
-    """First run has no HIDE_FILE yet, so the config constant is the default."""
-    raw = _read_text(HIDE_FILE).strip()
-    if raw in ("1", "0"):
-        return raw == "1"
-    return HIDE_FROM_SCREENSHARE
+    """First run has no saved choice yet, so the config constant is the default."""
+    value = settings.load().hide_from_screenshare
+    return value if value is not None else HIDE_FROM_SCREENSHARE
 
 
 # Whether app windows are currently hidden from screen capture. Read once at
@@ -812,6 +805,11 @@ class ChatWindow(QWidget):
         # is on screen. Reading an old call never revives it.
         self._viewing: str | None = None
 
+        # settings.json + additive legacy migration; loaded once here and read
+        # from for the whole window's lifetime, written through on every
+        # change via _set().
+        self.settings = settings.load()
+
         self._answer_length = self._load_length()  # applied to `brain` once it exists
         self._processing_secs = 0
         self._processing_timer = QTimer(self)
@@ -1144,7 +1142,7 @@ class ChatWindow(QWidget):
         # No fixed height: it takes whatever the split gives it, so dragging the
         # divider up is what makes the prompt readable.
         self.context_box.setMinimumHeight(64)
-        self.context_box.setPlainText(_read_text(CONTEXT_FILE))
+        self.context_box.setPlainText(self.settings.context)
         clay.addWidget(self.context_box, stretch=1)
 
         # Chips row: the few knobs that change per call, inline like a model picker.
@@ -1164,10 +1162,10 @@ class ChatWindow(QWidget):
             "Controlado: junta todo y responde cuando pulsas Enviar.\n"
             "Automático: responde en cada pausa."
         )
-        index = self.mode_combo.findData(_read_text(MODE_FILE, "controlled").strip())
+        index = self.mode_combo.findData(self.settings.listen_mode)
         self.mode_combo.setCurrentIndex(index if index >= 0 else 0)
         self.mode_combo.currentIndexChanged.connect(
-            lambda: _write_text(MODE_FILE, self._selected_mode())
+            lambda: self._set("listen_mode", self._selected_mode())
         )
 
         length_label = QLabel("✂️")
@@ -1221,7 +1219,7 @@ class ChatWindow(QWidget):
         if dialog.exec() == QDialog.Accepted:
             text = dialog.text()
             self.context_box.setPlainText(text)
-            _write_text(CONTEXT_FILE, text)
+            self._set("context", text)
             # A running call picks up the edit on its next question. No-op while
             # the models are still loading — _start_listening reads the box
             # fresh anyway once they're ready, so nothing is lost.
@@ -1250,6 +1248,11 @@ class ChatWindow(QWidget):
         return widget
 
     # ------------------------------------------------------------ settings
+    def _set(self, field: str, value) -> None:
+        """Update one settings.json field and write the whole document through."""
+        setattr(self.settings, field, value)
+        settings.save(self.settings)
+
     def _selected_mode(self) -> str:
         return self.mode_combo.currentData() or "controlled"
 
@@ -1266,7 +1269,7 @@ class ChatWindow(QWidget):
         if not devices:
             self.device_combo.addItem("(no se detectaron dispositivos)", None)
             return
-        saved = _read_text(DEVICE_FILE).strip()
+        saved = self.settings.device_name
         selected = 0
         for i, dev in enumerate(devices):
             self.device_combo.addItem(
@@ -1280,8 +1283,7 @@ class ChatWindow(QWidget):
         self.device_combo.setCurrentIndex(selected)
 
     def _load_length(self) -> str:
-        value = _read_text(LENGTH_FILE).strip()
-        return value if value in ("short", "detailed") else "short"
+        return self.settings.answer_length
 
     def _on_length_toggled(self, detailed: bool) -> None:
         self._answer_length = "detailed" if detailed else "short"
@@ -1289,7 +1291,7 @@ class ChatWindow(QWidget):
         # once `brain` exists.
         if self.brain is not None:
             self.brain.set_length(self._answer_length)
-        _write_text(LENGTH_FILE, self._answer_length)
+        self._set("answer_length", self._answer_length)
         self._update_length_hint()
 
     def _update_length_hint(self) -> None:
@@ -1302,7 +1304,7 @@ class ChatWindow(QWidget):
         # shown later (or the panel already on screen) reflects it too.
         global _stealth_enabled
         _stealth_enabled = hidden
-        _write_text(HIDE_FILE, "1" if hidden else "0")
+        self._set("hide_from_screenshare", hidden)
         _apply_stealth(self)
         _apply_stealth(self.panel)
 
@@ -1329,11 +1331,11 @@ class ChatWindow(QWidget):
             self._new_conversation()
 
         context = self.context_box.toPlainText().strip()
-        _write_text(CONTEXT_FILE, context)
+        self._set("context", context)
 
         device = self._selected_device()
         if device:
-            _write_text(DEVICE_FILE, device["name"])
+            self._set("device_name", device["name"])
         mode = self._selected_mode()
 
         listener = Listener(

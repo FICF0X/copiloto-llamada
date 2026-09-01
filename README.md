@@ -47,6 +47,14 @@ Necesitas tres cosas:
 
 Si algo falla, revisa la sección [Troubleshooting](#-troubleshooting) más abajo.
 
+### Actualizar a una versión nueva
+
+**Copia los archivos nuevos SOBRE la carpeta existente — nunca borres ni
+reemplaces la carpeta completa.** Junto a `CallAssist.exe` viven tu `.env`
+(la API key), `settings.json`, los archivos de configuración antiguos y la
+carpeta `conversations/` con el historial de llamadas guardadas: borrar la
+carpeta entera pierde todo eso.
+
 ---
 
 ## 🎬 Demo

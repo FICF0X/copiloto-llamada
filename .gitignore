@@ -54,3 +54,8 @@ build/
 dist/
 *.egg-info/
 *.zip
+
+# Consolidated settings store (holds the user context text)
+settings.json
+settings.json.corrupt
+settings.json.tmp
