@@ -86,6 +86,20 @@ PARTIAL_JOIN_TIMEOUT_S: float = 5.0
 # bound (and with it, the cost of every transcription pass over it).
 MAX_UTTERANCE_S: float = 45.0
 
+# --- Translator: source-language detect-and-lock (src/language_lock.py) ---
+# All three are unvalidated STARTING values pending the owner's calibration
+# against real call audio (slice 6 manual checklist) - kept here, not
+# hardcoded in language_lock.py, so tuning is a one-line change.
+# language_probability is a softmax over ~100 languages; >0.70 is meant to be
+# a decisive margin while <0.70 is usually a confusable-language cluster
+# (e.g. es/pt/it) on a short VAD-endpointed clip.
+LANGUAGE_LOCK_MIN_PROBABILITY: float = 0.70
+# Consecutive (not majority) agreeing confident samples needed to lock.
+LANGUAGE_LOCK_MIN_VOTES: int = 2
+# After this many utterances that produced ANY detection, lock to whichever
+# language was seen most often rather than leaving the session caption-less.
+LANGUAGE_LOCK_MAX_ATTEMPTS: int = 6
+
 # --- Conversation memory ---
 # Past messages (questions + answers) kept in context so follow-up questions
 # like "about what you just mentioned..." make sense. Higher = better memory but

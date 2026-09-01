@@ -17,7 +17,7 @@ class Utterance:
     """One transcribed chunk of speech handed to an engine."""
 
     text: str
-    language: str = ""  # transcriber.last_language for THIS utterance
+    language: str = ""  # detected by the transcription that produced this text
     language_probability: float = 0.0
 
 

@@ -3,10 +3,35 @@ from __future__ import annotations
 
 from src import cuda_setup  # noqa: F401 - registers CUDA DLLs, MUST come before faster_whisper
 
+from dataclasses import dataclass
+
 import numpy as np
 from faster_whisper import WhisperModel
 
 from src.config import WHISPER_LANGUAGE, WHISPER_MODEL
+
+
+@dataclass(frozen=True)
+class TranscriptionResult:
+    """What one transcribe() call produced: text AND the language it was
+    detected in, returned TOGETHER.
+
+    This is the fix for a language race (see src/listener.py): the language
+    used to belong only to `Transcriber.last_language`/
+    `last_language_probability` instance attributes, read by the caller
+    *after* the generator had already yielded the text. Between that yield
+    and the caller's read, `Listener._transcribe_preview` can run on its own
+    daemon thread and overwrite those same attributes with an unrelated
+    preview pass' result - so the utterance could end up tagged with the
+    PREVIEW's language instead of its own. Returning language+text together,
+    captured atomically at the moment THIS transcription finished, makes
+    that race impossible: there is no shared mutable state left to read
+    after the fact.
+    """
+
+    text: str
+    language: str = ""
+    language_probability: float = 0.0
 
 
 class Transcriber:
@@ -32,10 +57,18 @@ class Transcriber:
             model = WhisperModel(model_size, device="cpu", compute_type="int8")
             return model, "cpu", "int8"
 
-    def transcribe(self, audio: np.ndarray) -> str:
-        """Transcribe a mono float32 @ 16 kHz buffer into a single string."""
+    def transcribe(self, audio: np.ndarray) -> TranscriptionResult:
+        """Transcribe a mono float32 @ 16 kHz buffer.
+
+        Returns text + language TOGETHER (see TranscriptionResult) - this is
+        the source of truth callers must use. `last_language`/
+        `last_language_probability` below are still updated for
+        introspection (e.g. the manual _test() script) but are NOT safe to
+        read after the fact from a different thread; see the race this
+        replaces, documented on TranscriptionResult.
+        """
         if audio.size == 0:
-            return ""
+            return TranscriptionResult("", "", 0.0)
         segments, info = self.model.transcribe(
             audio,
             language=self.language,
@@ -43,9 +76,11 @@ class Transcriber:
             vad_filter=True,  # drop leading/trailing silence inside the buffer
         )
         text = " ".join(seg.text.strip() for seg in segments).strip()
-        self.last_language = getattr(info, "language", "") or ""
-        self.last_language_probability = float(getattr(info, "language_probability", 0.0) or 0.0)
-        return text
+        language = getattr(info, "language", "") or ""
+        probability = float(getattr(info, "language_probability", 0.0) or 0.0)
+        self.last_language = language
+        self.last_language_probability = probability
+        return TranscriptionResult(text, language, probability)
 
 
 def _test() -> None:
@@ -63,10 +98,10 @@ def _test() -> None:
     audio = np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)
 
     print("Transcribing...\n")
-    text = tr.transcribe(audio)
+    result = tr.transcribe(audio)
     print("-" * 50)
-    print(f"DETECTED LANGUAGE: {tr.last_language or '(none)'}")
-    print(f"TRANSCRIPTION: {text or '(nothing detected)'}")
+    print(f"DETECTED LANGUAGE: {result.language or '(none)'}")
+    print(f"TRANSCRIPTION: {result.text or '(nothing detected)'}")
     print("-" * 50)
 
 

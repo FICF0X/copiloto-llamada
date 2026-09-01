@@ -59,14 +59,19 @@ class CopilotWorker(QThread):
                 on_state=self.hearing.emit, on_partial=self.partial_text.emit
             )
         try:
-            for text in source:
+            # source yields (text, language, language_probability) TOGETHER,
+            # captured atomically inside the same transcribe() call that
+            # produced the text - never re-read from self.listener.transcriber
+            # after the fact. That used-to-be-implicit read was a real race:
+            # Listener's live-preview thread mutates that same shared state
+            # on its own daemon thread between a yield and this loop body
+            # resuming, so an utterance could get tagged with a PREVIEW
+            # pass' language instead of its own. See TranscriptionResult in
+            # src/transcriber.py and the yields in src/listener.py.
+            for text, language, language_probability in source:
                 if self.cancelled:
                     break
-                utt = Utterance(
-                    text,
-                    self.listener.transcriber.last_language,
-                    self.listener.transcriber.last_language_probability,
-                )
+                utt = Utterance(text, language, language_probability)
                 self.utterance_detected.emit(utt.text)
                 result = self.strategy.process(utt, self._cb)
                 self.result_ready.emit(result)

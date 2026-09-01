@@ -55,6 +55,13 @@ reemplaces la carpeta completa.** Junto a `CallAssist.exe` viven tu `.env`
 carpeta `conversations/` con el historial de llamadas guardadas: borrar la
 carpeta entera pierde todo eso.
 
+> **A partir de esta versión, el arranque ya no descarga el paquete de
+> traducción Argos en primer plano.** Antes, el primer arranque después de
+> instalar podía tardar un buen rato mientras se bajaba el modelo EN→ES en
+> segundo plano bloqueando la carga; ahora el traductor se construye al
+> instante y cada par de idiomas se descarga bajo demanda, sin congelar la
+> ventana, la primera vez que hace falta (modo Traductor).
+
 ---
 
 ## 🎬 Demo
@@ -245,7 +252,9 @@ All settings live in [`src/config.py`](src/config.py):
 | [`src/listener.py`](src/listener.py) | Capture, endpointing, and the bounded live preview |
 | [`src/transcriber.py`](src/transcriber.py) | Whisper on the GPU, CPU fallback |
 | [`src/brain.py`](src/brain.py) | Gemini, streaming, and conversation memory |
-| [`src/translator.py`](src/translator.py) | Offline EN→ES via Argos |
+| [`src/translator.py`](src/translator.py) | Offline multi-pair translation via Argos (direct or English-pivot routes) |
+| [`src/language_lock.py`](src/language_lock.py) | Translator mode's source-language detect-and-lock |
+| [`src/engines/translation.py`](src/engines/translation.py) | TranslatorStrategy - zero Gemini calls, structurally |
 | [`src/conversations.py`](src/conversations.py) | Saved calls on disk |
 
 ## 🩺 Troubleshooting

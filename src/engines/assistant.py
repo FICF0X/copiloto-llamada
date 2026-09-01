@@ -60,6 +60,21 @@ class AssistantStrategy:
             getattr(self.preset, "context", ""),
             getattr(self.preset, "answer_language", "en"),
         )
+        # Install the translation package now, once, if it is missing. The
+        # translator no longer downloads in its constructor, so without this
+        # a fresh install would answer every call with "traducción no
+        # disponible" forever. Doing it here also pays argostranslate's
+        # multi-second first import before the call starts, instead of
+        # stalling the worker right after the answer streams in.
+        if self.translate_answer_to:
+            try:
+                self.translator.ensure_route(
+                    self._answer_language(), self.translate_answer_to
+                )
+            except Exception:  # noqa: BLE001 - translation is best-effort
+                # translate() already degrades to a visible placeholder; a
+                # missing package must never stop the call from happening.
+                pass
 
     def process(self, utterance: Utterance, cb: EngineCallbacks) -> EngineResult:
         cb.on_status("Pensando...")
@@ -103,7 +118,9 @@ class AssistantStrategy:
         translation = ""
         if answer and self.translate_answer_to:
             cb.on_status("Traduciendo...")
-            translation = self.translator.translate(answer)
+            translation = self.translator.translate(
+                answer, self._answer_language(), self.translate_answer_to
+            )
 
         return EngineResult(
             source=utterance.text,
@@ -116,6 +133,9 @@ class AssistantStrategy:
             primary_language=getattr(self.preset, "answer_language", "en"),
             error=failure,
         )
+
+    def _answer_language(self) -> str:
+        return getattr(self.preset, "answer_language", "en") or "en"
 
     def close(self) -> None:
         pass

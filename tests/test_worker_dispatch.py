@@ -20,10 +20,19 @@ from src.worker import CopilotWorker
 
 
 class FakeListener:
-    """Stands in for Listener: yields canned utterances, records call shape."""
+    """Stands in for Listener: yields canned (text, language, probability)
+    utterances - matching what the real Listener.listen()/
+    capture_until_stop() yield since the language-race fix (src/listener.py,
+    src/transcriber.py). A bare string is auto-wrapped with ("", 0.0) so
+    tests that don't care about language stay terse.
+    """
 
     def __init__(self, utterances, transcriber=None):
-        self.utterances = list(utterances)
+        self.utterances = [
+            u if isinstance(u, tuple) else (u, "", 0.0) for u in utterances
+        ]
+        # No longer read by CopilotWorker (that was the bug) - kept only so
+        # any test/fake that still sets it doesn't need to change shape.
         self.transcriber = transcriber or SimpleNamespace(
             last_language="en", last_language_probability=0.87
         )
@@ -52,7 +61,7 @@ class RaisingListener(FakeListener):
 
     def capture_until_stop(self, on_state=None, on_partial=None):
         self.capture_until_stop_calls += 1
-        yield "ok"
+        yield "ok", "", 0.0
         raise RuntimeError("mic died")
 
 
@@ -156,9 +165,11 @@ def test_full_dispatch_signal_order_for_two_utterances():
     assert events[5][0] == "result" and events[5][1].primary == "ans2"
 
 
-def test_utterance_built_from_transcriber_language_fields():
-    transcriber = SimpleNamespace(last_language="fr", last_language_probability=0.42)
-    listener = FakeListener(["bonjour"], transcriber=transcriber)
+def test_utterance_built_from_the_per_utterance_language_tuple():
+    """Utterance.language/language_probability come from the (text, language,
+    probability) tuple the source yields for THIS utterance - not from any
+    listener.transcriber state read after the fact."""
+    listener = FakeListener([("bonjour", "fr", 0.42)])
     strategy = FakeStrategy([EngineResult(source="bonjour", primary="ans")])
     worker = CopilotWorker(listener, strategy, mode="controlled")
 
@@ -168,6 +179,28 @@ def test_utterance_built_from_transcriber_language_fields():
     assert utt.text == "bonjour"
     assert utt.language == "fr"
     assert utt.language_probability == 0.42
+
+
+def test_utterance_language_unaffected_by_stale_transcriber_state():
+    """Regression test for the language race that used to exist here: the
+    real Listener's live-preview thread mutates transcriber.last_language on
+    a daemon thread AFTER a generator yield returns control to this loop, so
+    CopilotWorker must NEVER read language off self.listener.transcriber -
+    only off the tuple the source itself yielded. This fake proves it by
+    setting listener.transcriber to something deliberately WRONG; the old
+    buggy implementation (`Utterance(text, self.listener.transcriber.
+    last_language, ...)`) would have failed this test.
+    """
+    stale_transcriber = SimpleNamespace(last_language="STALE", last_language_probability=0.01)
+    listener = FakeListener([("hola", "es", 0.91)], transcriber=stale_transcriber)
+    strategy = FakeStrategy([EngineResult(source="hola", primary="ans")])
+    worker = CopilotWorker(listener, strategy, mode="controlled")
+
+    worker.run()
+
+    utt = strategy.processed[0]
+    assert utt.language == "es"
+    assert utt.language_probability == 0.91
 
 
 def test_result_ready_carries_the_exact_object_strategy_returned():

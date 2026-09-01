@@ -19,7 +19,21 @@ import pytest
 def _stub_google_genai() -> None:
     if "google.genai" in sys.modules:
         return
-    google = sys.modules.setdefault("google", types.ModuleType("google"))
+    try:
+        # Prefer the REAL `google` namespace package (installed transitively
+        # by e.g. `protobuf`) if one is importable. `sys.modules.setdefault`
+        # used to blindly insert a bare `types.ModuleType("google")` when
+        # nothing had imported `google` yet - but that fake module has no
+        # `__path__`, so it permanently shadows the real namespace package
+        # for the REST of the test session (sys.modules is process-global
+        # and never rolled back). Any later test that needs a genuine
+        # `google.*` submodule (e.g. `google.protobuf`, pulled in
+        # transitively by `argostranslate` -> `stanza`) would then fail with
+        # "'google' is not a package" purely because of import ORDER -
+        # discovered while adding slice 6's translator tests.
+        import google
+    except ImportError:
+        google = sys.modules.setdefault("google", types.ModuleType("google"))
     genai = types.ModuleType("google.genai")
     genai_types = types.ModuleType("google.genai.types")
 

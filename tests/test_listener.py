@@ -19,18 +19,24 @@ import pytest
 
 from src import audio_source
 from src.listener import Listener
+from src.transcriber import TranscriptionResult
 
 
 class FakeTranscriber:
     """Stands in for Transcriber: no Whisper model, no GPU, no CUDA."""
 
-    def __init__(self, text: str = "hello") -> None:
+    def __init__(self, text: str = "hello", language: str = "", probability: float = 0.0) -> None:
         self._text = text
+        self._detected_language = language
+        self._detected_probability = probability
         self.language: str | None = None
         self.last_language = ""
+        self.last_language_probability = 0.0
 
-    def transcribe(self, audio: np.ndarray) -> str:
-        return self._text
+    def transcribe(self, audio: np.ndarray) -> TranscriptionResult:
+        self.last_language = self._detected_language
+        self.last_language_probability = self._detected_probability
+        return TranscriptionResult(self._text, self._detected_language, self._detected_probability)
 
 
 class FakeAudioSource:
@@ -98,7 +104,7 @@ def test_listener_uses_injected_factory_with_device_index():
     assert seen_device_indexes == [7]
     assert fake_source.started is True
     assert fake_source.stopped is True
-    assert results == ["hello"]
+    assert results == [("hello", "", 0.0)]
 
 
 def test_capture_until_stop_transcribes_accumulated_frames():
@@ -107,14 +113,14 @@ def test_capture_until_stop_transcribes_accumulated_frames():
     fake_source = FakeAudioSource(chunks=[chunk1, chunk2])
 
     listener = Listener(
-        FakeTranscriber(text="hello capture"),
+        FakeTranscriber(text="hello capture", language="en", probability=0.93),
         open_source=lambda device_index: fake_source,
     )
     fake_source.listener = listener
 
     results = list(listener.capture_until_stop())
 
-    assert results == ["hello capture"]
+    assert results == [("hello capture", "en", 0.93)]
     assert fake_source.stopped is True
 
 
@@ -154,7 +160,7 @@ def test_listen_vad_loop_yields_one_utterance_via_fake_source(monkeypatch):
     fake_source = FakeAudioSource(chunks=[big_chunk])
 
     listener = Listener(
-        FakeTranscriber(text="hello listen"),
+        FakeTranscriber(text="hello listen", language="fr", probability=0.81),
         open_source=lambda device_index: fake_source,
     )
     fake_source.listener = listener
@@ -169,7 +175,7 @@ def test_listen_vad_loop_yields_one_utterance_via_fake_source(monkeypatch):
 
     results = list(listener.listen())
 
-    assert results == ["hello listen"]
+    assert results == [("hello listen", "fr", 0.81)]
     assert fake_source.started is True
     assert fake_source.stopped is True
 
@@ -201,3 +207,30 @@ def test_a_fresh_source_is_opened_for_every_run(monkeypatch):
 
     assert len(opened) == 2, "each run must open its own source"
     assert all(source.stopped for source in opened), "every source must be stopped"
+
+
+def test_transcribe_preview_language_never_leaks_into_the_final_transcription():
+    """Regression test for the language race: _transcribe_preview only ever
+    returns text, and _transcribe_locked's returned language/probability
+    come from ITS OWN transcribe() call - a preview pass mutating the
+    transcriber's last_language/last_language_probability afterwards must
+    never be visible in what _transcribe_locked already returned."""
+    fake = FakeTranscriber(text="ignored", language="es", probability=0.9)
+    listener = Listener(fake)
+
+    locked_result = listener._transcribe_locked(np.zeros(10, dtype=np.float32))
+    assert locked_result.language == "es"
+    assert locked_result.language_probability == 0.9
+
+    # A LATER preview pass detects a totally different language...
+    fake._detected_language = "de"
+    fake._detected_probability = 0.99
+    preview_text = listener._transcribe_preview(np.zeros(10, dtype=np.float32))
+
+    # ...which only ever comes back as TEXT, and the earlier locked_result
+    # object (already handed to the caller) is completely unaffected -
+    # there is nothing left to "leak" into, because it was never a live
+    # reference into transcriber state to begin with.
+    assert preview_text == "ignored"
+    assert locked_result.language == "es"
+    assert locked_result.language_probability == 0.9

@@ -1195,6 +1195,44 @@ class ModelLoader(QThread):
         self.ready.emit(transcriber, brain, translator)
 
 
+class PairInstaller(QThread):
+    """Ensures one Argos language pair is usable, off the GUI thread.
+
+    Same idiom as ModelLoader: no return value, just signals, so the window
+    never blocks on a download. Triggered when the user picks a Translator
+    target language or the moment the detected source language locks (both
+    wired in slice 7) - never by pressing "Escuchar", which must never
+    freeze waiting on a package to download mid-call.
+    """
+
+    progress = Signal(str)  # indeterminate status text (argostranslate's
+    # package.download() exposes no byte-level progress callback - verified
+    # against 1.11.0, see the slice 6 apply-progress investigation notes)
+    done = Signal(bool, str)  # ok, user-facing Spanish message
+
+    def __init__(self, translator: Translator, from_code: str, to_code: str) -> None:
+        super().__init__()
+        self.translator = translator
+        self.from_code = from_code
+        self.to_code = to_code
+
+    def run(self) -> None:
+        try:
+            route = self.translator.ensure_route(
+                self.from_code, self.to_code, on_status=self.progress.emit
+            )
+        except Exception as exc:  # noqa: BLE001 - surfaced in the UI, not a hidden console
+            self.done.emit(False, str(exc))
+            return
+        if route.kind == "pivot":
+            self.done.emit(
+                True,
+                "Listo (vía inglés - puede tardar más y perder algo de calidad).",
+            )
+        else:
+            self.done.emit(True, "Listo.")
+
+
 class ChatWindow(QWidget):
     """Setup and full transcript. The Live panel takes over during the call."""
 

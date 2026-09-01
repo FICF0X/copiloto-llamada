@@ -21,10 +21,16 @@ from src.config import (
     SAMPLE_RATE,
     SILENCE_MS_TO_ENDPOINT,
 )
-from src.transcriber import Transcriber
+from src.transcriber import Transcriber, TranscriptionResult
 
 # How often the live-transcription thread refreshes the partial text (seconds).
 PARTIAL_INTERVAL_S = 1.0
+
+# What listen()/capture_until_stop() yield per utterance: text plus the
+# language captured from the SAME transcribe() call that produced it (never
+# read back from shared state afterwards - see the module docstring and
+# TranscriptionResult in src/transcriber.py for the race this replaces).
+TranscribedUtterance = tuple[str, str, float]
 
 
 def _tail(frames: list[np.ndarray], max_samples: int) -> np.ndarray:
@@ -77,7 +83,7 @@ class Listener:
         # transcription never hit Whisper at the same time.
         self._model_lock = threading.Lock()
 
-    def _transcribe_locked(self, audio: np.ndarray) -> str:
+    def _transcribe_locked(self, audio: np.ndarray) -> TranscriptionResult:
         with self._model_lock:
             return self.transcriber.transcribe(audio)
 
@@ -87,11 +93,19 @@ class Listener:
         Never waits for the lock: the final transcription is what the user is
         actually waiting on, so it always wins the model. A skipped preview just
         costs one missed refresh, which nobody notices.
+
+        Only the TEXT is used for the preview - its language is discarded on
+        purpose. Reading the language back out of this pass (or out of
+        `self.transcriber` afterwards) is exactly the race that used to tag
+        an utterance with the wrong language; the real utterance's language
+        comes only from `_transcribe_locked`'s own return value, captured in
+        the same generator step that produces its text (see
+        capture_until_stop()/listen() below).
         """
         if not self._model_lock.acquire(blocking=False):
             return ""
         try:
-            return self.transcriber.transcribe(audio)
+            return self.transcriber.transcribe(audio).text
         finally:
             self._model_lock.release()
 
@@ -113,7 +127,7 @@ class Listener:
         self,
         on_state: Callable[[str], None] | None = None,
         on_partial: Callable[[str], None] | None = None,
-    ) -> Iterator[str]:
+    ) -> Iterator[TranscribedUtterance]:
         """Controlled mode: record ALL audio from start until stop() is called,
         then transcribe the whole thing as a single utterance and yield it once.
 
@@ -126,6 +140,11 @@ class Listener:
         PARTIAL_WINDOW_S seconds heard, refreshed on a background thread so
         capture never stalls. It is a "still hearing you" indicator, not the
         transcript — the full recording is transcribed once, at the end.
+
+        Yields (text, language, language_probability) - not just text. The
+        language comes from the same transcribe() call that produced the
+        text, never from re-reading `self.transcriber` afterwards (that is
+        the language-race fix; see TranscriptionResult's docstring).
         """
         def state(value: str) -> None:
             if on_state is not None:
@@ -179,9 +198,9 @@ class Listener:
             return
         state("transcribing")
         audio = np.concatenate(frames)
-        text = self._transcribe_locked(audio)
-        if text:
-            yield text
+        result = self._transcribe_locked(audio)
+        if result.text:
+            yield result.text, result.language, result.language_probability
 
     def _is_speech(self, frame: np.ndarray) -> bool:
         pcm16 = (np.clip(frame, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
@@ -191,7 +210,7 @@ class Listener:
         self,
         on_state: Callable[[str], None] | None = None,
         on_partial: Callable[[str], None] | None = None,
-    ) -> Iterator[str]:
+    ) -> Iterator[TranscribedUtterance]:
         """Yield transcribed utterances.
 
         on_state, if given, is called with live capture states for UI feedback:
@@ -201,6 +220,10 @@ class Listener:
         on_partial, if given, receives the live transcription of the last
         PARTIAL_WINDOW_S seconds of the CURRENT utterance, refreshed on a
         background thread so the VAD loop never stalls waiting on Whisper.
+
+        Yields (text, language, language_probability) - see
+        capture_until_stop()'s docstring for why the language rides along
+        with the text instead of being read back from shared state.
         """
         def state(value: str) -> None:
             if on_state is not None:
@@ -284,9 +307,9 @@ class Listener:
                         state("transcribing")
                         with utt_lock:
                             audio = np.concatenate(utterance)
-                        text = self._transcribe_locked(audio)
-                        if text:
-                            yield text
+                        result = self._transcribe_locked(audio)
+                        if result.text:
+                            yield result.text, result.language, result.language_probability
                     # reset for the next utterance (in place, keeps ref)
                     with utt_lock:
                         utterance.clear()
@@ -312,9 +335,9 @@ def _test(seconds: int = 30) -> None:
 
     start = time.time()
     count = 0
-    for text in listener.listen():
+    for text, language, probability in listener.listen():
         count += 1
-        print(f"  [{count}] {text}")
+        print(f"  [{count}] ({language} {probability:.2f}) {text}")
         if time.time() - start > seconds:
             break
 

@@ -37,8 +37,14 @@ class FakeTranslator:
     def __init__(self, result: str = "[es]"):
         self.result = result
         self.calls: list[str] = []
+        self.pairs: list[tuple[str, str]] = []
+        self.routes: list[tuple[str, str]] = []
 
-    def translate(self, text: str) -> str:
+    def ensure_route(self, from_code: str, to_code: str, on_status=None) -> None:
+        self.routes.append((from_code, to_code))
+
+    def translate(self, text: str, from_code: str = "en", to_code: str = "es") -> str:
+        self.pairs.append((from_code, to_code))
         self.calls.append(text)
         return self.result
 
