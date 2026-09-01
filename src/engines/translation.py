@@ -50,7 +50,9 @@ class TranslatorStrategy:
 
     def _init_session_state(self) -> None:
         self._previous_language = getattr(self.transcriber, "language", None)
+        self._resolved_pair: tuple[str, str] | None = None
         self._route_failure = ""
+        self._route_kind = ""  # set once ensure_route succeeds; see process()
 
     def start(self) -> None:
         """Called once, on the worker thread, before the capture loop.
@@ -93,11 +95,25 @@ class TranslatorStrategy:
         # Resolved once per session, never per utterance: a failure here is
         # a blocking network call, and retrying it on every utterance would
         # stall the capture loop again and again while audio goes undrained.
-        if not self._route_failure:
+        # Keyed by the pair, not by "resolved once": a manual override
+        # changes the source mid-session, and a stale cache would translate
+        # over a route that was never installed - silently recording the
+        # "unavailable" placeholder as if it were a translation.
+        pair = (source_lang, self.target_lang)
+        if pair != self._resolved_pair:
+            self._resolved_pair = pair
+            self._route_failure = ""
+            self._route_kind = ""
+        if not self._route_failure and not self._route_kind:
             try:
-                self.translator.ensure_route(
+                route = self.translator.ensure_route(
                     source_lang, self.target_lang, on_status=cb.on_status
                 )
+                # Cached for the rest of the session (see the field's own
+                # comment): the UI reads this off every subsequent
+                # EngineResult so it can show the pivot-quality warning once,
+                # not renegotiate route resolution on every line.
+                self._route_kind = route.kind
             except Exception as exc:  # noqa: BLE001 - typed package errors
                 self._route_failure = str(exc)
         if self._route_failure:
@@ -120,6 +136,7 @@ class TranslatorStrategy:
             answer=translated,
             source_language=source_lang,
             primary_language=self.target_lang,
+            route_kind=self._route_kind,
         )
 
     def close(self) -> None:

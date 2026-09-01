@@ -74,3 +74,77 @@ def test_matches_still_searches_question_answer_translation_with_new_fields(
 
     assert convo.matches("bonjour") is True
     assert convo.matches("nothing here") is False
+
+
+# --- Translator exchange shape (tasks 7.6/7.7) -------------------------------
+#
+# Spec's resolved question #2: a Translator exchange has NO question/answer
+# fields - {heard_text, detected_source_language, translated_text,
+# target_language, timestamp} instead, reusing the same per-file JSON store.
+
+
+def test_translator_exchange_builds_the_spec_shape():
+    exchange = conversations.translator_exchange(
+        heard_text="bonjour", detected_source_language="fr",
+        translated_text="hola", target_language="es", timestamp="2026-01-01T00:00:00",
+    )
+
+    assert exchange == {
+        "heard_text": "bonjour",
+        "detected_source_language": "fr",
+        "translated_text": "hola",
+        "target_language": "es",
+        "timestamp": "2026-01-01T00:00:00",
+    }
+    assert "question" not in exchange
+    assert "answer" not in exchange
+
+
+def test_translator_exchange_defaults_timestamp_to_now():
+    exchange = conversations.translator_exchange("bonjour", "fr", "hola", "es")
+    assert exchange["timestamp"]  # non-empty, ISO-shaped
+
+
+def test_translator_exchange_round_trips_through_save_and_load(isolated_conversations):
+    convo = conversations.new_conversation()
+    convo.mode = "translator"
+    convo.exchanges.append(
+        conversations.translator_exchange("bonjour", "fr", "hola", "es", "2026-01-01T00:00:00")
+    )
+
+    assert conversations.save(convo) is True
+    loaded = conversations.load(convo.id)
+
+    assert loaded is not None
+    assert loaded.mode == "translator"
+    assert loaded.exchanges == [
+        {
+            "heard_text": "bonjour",
+            "detected_source_language": "fr",
+            "translated_text": "hola",
+            "target_language": "es",
+            "timestamp": "2026-01-01T00:00:00",
+        }
+    ]
+
+
+def test_title_derives_from_heard_text_for_a_translator_conversation(isolated_conversations):
+    convo = conversations.new_conversation()
+    convo.mode = "translator"
+    convo.exchanges.append(
+        conversations.translator_exchange("bonjour tout le monde", "fr", "hola a todos", "es")
+    )
+
+    assert convo.title == "bonjour tout le monde"
+
+
+def test_matches_searches_translator_exchange_fields(isolated_conversations):
+    convo = conversations.new_conversation()
+    convo.mode = "translator"
+    convo.exchanges.append(
+        conversations.translator_exchange("bonjour", "fr", "hola mundo", "es")
+    )
+
+    assert convo.matches("bonjour") is True  # heard_text
+    assert convo.matches("hola mundo") is True  # translated_text
+    assert convo.matches("nothing here") is False

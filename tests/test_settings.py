@@ -233,3 +233,35 @@ def test_stored_preset_id_resolves_to_the_matching_preset(
 
     assert active.id == university.id
     assert active.answer_language == "es"
+
+
+# --- Call-mode resolution (task 7.1: mode selector persisted via
+# settings.mode) ---------------------------------------------------------
+
+
+def test_fresh_install_mode_defaults_to_assistant(isolated_settings):
+    assert settings.load().mode == "assistant"
+
+
+def test_translator_mode_round_trips_through_save_and_load(isolated_settings):
+    s = settings.Settings(mode="translator")
+    settings.save(s)
+
+    assert settings.load().mode == "translator"
+
+
+def test_corrupt_or_unknown_mode_value_falls_back_to_assistant(isolated_settings):
+    settings.SETTINGS_FILE.write_text(
+        '{"schema": 1, "mode": "not-a-real-mode"}', encoding="utf-8"
+    )
+
+    assert settings.load().mode == "assistant"
+
+
+def test_valid_mode_helper_accepts_only_the_two_known_modes():
+    assert settings._valid_mode("assistant") == "assistant"
+    assert settings._valid_mode("translator") == "translator"
+    assert settings._valid_mode("") == "assistant"
+    assert settings._valid_mode("  translator  ") == "translator"  # trimmed first
+    assert settings._valid_mode("nonsense") == "assistant"
+    assert settings._valid_mode(None) == "assistant"

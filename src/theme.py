@@ -222,6 +222,39 @@ def stylesheet(own_corners: bool = False) -> str:
             border-color: rgba(255, 255, 255, 52);
         }}
 
+        /* Mode selector (slice 7): a two-button segmented control, checked
+        exclusively via QButtonGroup. Reuses #ghost's resting look so an
+        unstyled default Qt button never ships, with an ACCENT `:checked`
+        state to read as "the active mode" at a glance. */
+        QPushButton#segmentleft, QPushButton#segmentright {{
+            background-color: {GLASS_RAISED};
+            color: {INK};
+            border: 1px solid {STROKE};
+            font-size: {PT_SMALL}pt;
+            font-weight: 600;
+            padding: 6px 16px;
+        }}
+        QPushButton#segmentleft {{
+            border-top-left-radius: {RADIUS_MD}px;
+            border-bottom-left-radius: {RADIUS_MD}px;
+            border-right: none;
+        }}
+        QPushButton#segmentright {{
+            border-top-right-radius: {RADIUS_MD}px;
+            border-bottom-right-radius: {RADIUS_MD}px;
+        }}
+        QPushButton#segmentleft:hover, QPushButton#segmentright:hover {{
+            background-color: {GLASS_HOVER};
+        }}
+        QPushButton#segmentleft:checked, QPushButton#segmentright:checked {{
+            background: {ACCENT_GRADIENT};
+            color: #ffffff;
+            border-color: transparent;
+        }}
+        QPushButton#segmentleft:disabled, QPushButton#segmentright:disabled {{
+            color: {INK_FAINT};
+        }}
+
         QPushButton#newchat {{
             background-color: {GLASS_RAISED};
             color: {INK};
@@ -405,6 +438,22 @@ def panel_stylesheet(own_corners: bool = False) -> str:
             border: 1px solid {STROKE_SOFT};
             border-radius: {RADIUS_MD}px;
             padding: 9px 11px;
+        }}
+        QComboBox#chip {{
+            background-color: {GLASS_RAISED};
+            color: {INK};
+            border: 1px solid {STROKE};
+            border-radius: {RADIUS_PILL}px;
+            padding: 5px 10px;
+            font-size: {PT_CAPTION}pt;
+        }}
+        QComboBox#chip:hover {{ background-color: {GLASS_HOVER}; }}
+        QComboBox#chip::drop-down {{ border: none; width: 16px; }}
+        QComboBox#chip QAbstractItemView {{
+            background-color: #171A24;
+            color: {INK};
+            selection-background-color: {ACCENT};
+            outline: none;
         }}
         QTextEdit#panelanswer {{
             background-color: rgba(255, 255, 255, 14);

@@ -33,6 +33,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -54,7 +55,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from src import config, conversations, presets, settings, theme
+from src import config, conversations, panel_labels, presets, settings, theme
 from src.audio_source import list_devices
 from src.brain import Brain
 from src.config import (
@@ -64,6 +65,8 @@ from src.config import (
     USAGE_FILE,
 )
 from src.engines.assistant import AssistantStrategy
+from src.engines.translation import TranslatorStrategy
+from src.language_lock import LanguageLock
 from src.listener import Listener
 from src.transcriber import Transcriber
 from src.translator import Translator
@@ -457,6 +460,13 @@ class LivePanel(QWidget):
     listen_requested = Signal()
     cancel_requested = Signal()
     closed = Signal()
+    # Translator-only (slice 7): the continuous state has no send/cancel
+    # step, only a single "stop the session" action, and the "detected
+    # language - change" override the spec pins to this panel rather than
+    # the composer (deferred question #3: detection only happens once real
+    # audio is being heard, so the composer never has a value to show).
+    stop_requested = Signal()
+    override_requested = Signal(str)  # a language code the user picked
 
     def __init__(self) -> None:
         super().__init__()
@@ -498,6 +508,31 @@ class LivePanel(QWidget):
         self.heard_label.setWordWrap(True)
         self.heard_label.setMinimumHeight(38)
         lay.addWidget(self.heard_label)
+
+        # --- Translator only: detected source language + manual override.
+        # Spec's resolved question #3 pins this control HERE, not the
+        # composer - detection only happens once real audio is being heard
+        # during a session, so a pre-listening composer control would never
+        # have a value to show. Hidden entirely in Assistant mode.
+        self.detected_row = QWidget()
+        drow = QHBoxLayout(self.detected_row)
+        drow.setContentsMargins(0, 0, 0, 0)
+        drow.setSpacing(6)
+        self.detected_lang_label = QLabel("Idioma detectado: —")
+        self.detected_lang_label.setObjectName("panelheard")
+        self.change_lang_combo = QComboBox()
+        self.change_lang_combo.setObjectName("chip")
+        for code, label in panel_labels.TRANSLATOR_TARGET_LANGUAGES:
+            self.change_lang_combo.addItem(label, code)
+        self.change_lang_combo.setCurrentIndex(-1)
+        self.change_lang_combo.setToolTip("Cambiar el idioma detectado manualmente")
+        # `activated` only fires on an explicit user pick, never when this
+        # combo is repopulated/synced programmatically from set_detected_language.
+        self.change_lang_combo.activated.connect(self._on_change_lang_selected)
+        drow.addWidget(self.detected_lang_label, stretch=1)
+        drow.addWidget(self.change_lang_combo)
+        lay.addWidget(self.detected_row)
+        self.detected_row.hide()
 
         # --- The answer, read here without switching windows ---
         self.answer_box = QTextEdit()
@@ -549,17 +584,28 @@ class LivePanel(QWidget):
 
         geo = _read_geometry(PANEL_GEOMETRY_FILE, PANEL_DEFAULT)
         self.setGeometry(*geo)
-        self._mode = "listening"  # listening -> processing -> done
+        self._mode = "listening"  # listening -> processing -> done (Assistant only)
         self._es_visible = True
+        self._continuous = False  # True while a Translator session is active
+        self._call_mode = panel_labels.ASSISTANT
+        self._labels = panel_labels.labels_for(self._call_mode)
 
     # --- Actions ---
     def _on_action(self) -> None:
+        if self._continuous:
+            self.stop_requested.emit()
+            return
         if self._mode == "listening":
             self.send_requested.emit()
         elif self._mode == "processing":
             self.cancel_requested.emit()
         elif self._mode == "done":
             self.listen_requested.emit()
+
+    def _on_change_lang_selected(self, index: int) -> None:
+        code = self.change_lang_combo.itemData(index)
+        if code:
+            self.override_requested.emit(code)
 
     def _toggle_es(self) -> None:
         self._es_visible = not self._es_visible
@@ -574,14 +620,75 @@ class LivePanel(QWidget):
         self.translation_box.setPlainText(text)
         self._sync_translation()
 
+    # --- Mode (slice 7: LivePanel's hardcoded Assistant vocabulary becomes
+    # a per-mode label set - design's change map entry for this file) ------
+    def set_mode(self, mode: str) -> None:
+        """Switch the panel's vocabulary and translator-only controls.
+
+        Called once per session, right before set_listening()/
+        set_listening_continuous() (see ChatWindow._start_listening) - never
+        mid-session, since mode switching is idle-only.
+        """
+        self._call_mode = mode
+        self._labels = panel_labels.labels_for(mode)
+        self.state_label.setText(self._labels["header"])
+        self.heard_label.setText(self._labels["heard_placeholder"])
+        is_translator = mode == panel_labels.TRANSLATOR
+        self.detected_row.setVisible(is_translator)
+        # The ES toggle shows/hides EngineResult.secondary - Translator never
+        # fills it (its translated text IS the primary bubble already), so
+        # the toggle is meaningless there.
+        self.es_btn.setVisible(not is_translator)
+        if is_translator:
+            self.detected_lang_label.setText("Idioma detectado: —")
+            self.change_lang_combo.blockSignals(True)
+            self.change_lang_combo.setCurrentIndex(-1)
+            self.change_lang_combo.blockSignals(False)
+
+    def set_detected_language(self, code: str, manual: bool = False) -> None:
+        label = panel_labels.language_label(code)
+        prefix = "Idioma (elegido)" if manual else "Idioma detectado"
+        self.detected_lang_label.setText(f"{prefix}: {label}")
+
     # --- State ---
     def set_listening(self) -> None:
         self._mode = "listening"
+        self._continuous = False
         self.action_btn.setEnabled(True)
-        self.action_btn.setText("■ Enviar y responder")
+        self.action_btn.setText(self._labels["action_listening"])
         self.answer_box.clear()
         self.translation_box.clear()
         self._sync_translation()
+
+    def label(self, key: str) -> str:
+        """One label from the active mode's set, for callers outside the panel."""
+        return self._labels[key]
+
+    def set_listening_continuous(self) -> None:
+        """Translator's only active state (spec: continuous, Stop-only, no
+        send step) - one label, appended-to rather than replaced."""
+        self._mode = "listening"
+        self._continuous = True
+        self.action_btn.setEnabled(True)
+        self.action_btn.setText(self._labels["action_listening"])
+        self.action_btn.setToolTip("Detener la traducción en vivo")
+        self.answer_box.clear()
+        # The assistant's Spanish strip has no meaning here, and the button
+        # that hides it is hidden in this mode - left alone it would stay on
+        # screen, unremovable, for the whole call.
+        self.set_translation("")
+
+    def append_translation_line(self, text: str) -> None:
+        """Continuous Translator state: each translated utterance is
+        appended as its own line, never replacing what came before (design's
+        change map: "a continuous translator state")."""
+        cursor = self.answer_box.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        self.answer_box.setTextCursor(cursor)
+        if self.answer_box.toPlainText():
+            self.answer_box.insertPlainText("\n")
+        self.answer_box.insertPlainText(text)
+        self.answer_box.ensureCursorVisible()
 
     def set_processing(self, seconds: int) -> None:
         # Stays enabled on purpose: a disabled button here is what turned a slow
@@ -593,8 +700,10 @@ class LivePanel(QWidget):
 
     def set_done(self) -> None:
         self._mode = "done"
+        self._continuous = False
         self.action_btn.setEnabled(True)
-        self.action_btn.setText("● Escuchar de nuevo")
+        self.action_btn.setText(self._labels["action_done"])
+        self.action_btn.setToolTip("")
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
@@ -1199,10 +1308,28 @@ class PairInstaller(QThread):
     """Ensures one Argos language pair is usable, off the GUI thread.
 
     Same idiom as ModelLoader: no return value, just signals, so the window
-    never blocks on a download. Triggered when the user picks a Translator
-    target language or the moment the detected source language locks (both
-    wired in slice 7) - never by pressing "Escuchar", which must never
-    freeze waiting on a package to download mid-call.
+    never blocks on a download. Wired in slice 7 to two triggers - never to
+    pressing "Escuchar", which must never freeze waiting on a package to
+    download mid-call:
+
+    1. Picking a target language in the composer, IF a source is already
+       known from a PREVIOUS session's manual override
+       (settings.translator_source_override) - see
+       ChatWindow._prewarm_translator_pair.
+    2. The Live panel's "detected language - change" override, which always
+       makes a real source known immediately - see
+       ChatWindow._on_source_override.
+
+    An automatic LanguageLock lock (no manual override, just enough
+    consecutive confident samples) does NOT go through this class - it still
+    resolves inline inside TranslatorStrategy.process() on the worker
+    thread, exactly as slice 6 already built it. That call blocks the
+    worker thread (not the GUI thread, which stays responsive) for one
+    utterance the first time a session locks - an accepted, already-documented
+    cost from slice 6, not reworked here. A future slice could add a
+    lock-fired signal from the strategy back to chat_app to pre-warm that
+    case too; deliberately out of scope for this batch (see apply-progress
+    Deviations).
     """
 
     progress = Signal(str)  # indeterminate status text (argostranslate's
@@ -1277,10 +1404,31 @@ class ChatWindow(QWidget):
         # of throwing away everything the app just heard.
         self._last_heard = ""
 
+        # Translator's session-scoped source-language decision (design PINNED
+        # DECISION 4). One instance for the window's whole lifetime, reset()
+        # at the start of every Translator session in _start_listening -
+        # "reset only happens at _start_listening (new session)" is the
+        # design's own rule; mid-session it only ever locks/overrides.
+        self.lock = LanguageLock(
+            min_probability=config.LANGUAGE_LOCK_MIN_PROBABILITY,
+            min_votes=config.LANGUAGE_LOCK_MIN_VOTES,
+            max_attempts=config.LANGUAGE_LOCK_MAX_ATTEMPTS,
+        )
+        # PairInstaller (slice 6) must be held on self once started - Qt
+        # garbage-collects a QThread with no living Python reference mid-run,
+        # which would silently kill an in-flight download (known issue from
+        # the slice 6 review, fixed here rather than in slice 6 itself since
+        # this is the first slice that actually starts one).
+        self._pair_installer: PairInstaller | None = None
+        self._pivot_warning_shown = False  # once per Translator session, not per line
+        self._last_detected_lang = ""
+
         self.panel = LivePanel()
         self.panel.send_requested.connect(self._send_now)
         self.panel.listen_requested.connect(self._start_listening)
         self.panel.cancel_requested.connect(self._cancel_send)
+        self.panel.stop_requested.connect(self._stop_listening)
+        self.panel.override_requested.connect(self._on_source_override)
         self.panel.closed.connect(self._close_panel)
 
         _apply_app_icon(self)
@@ -1566,8 +1714,45 @@ class ChatWindow(QWidget):
         clay.setContentsMargins(16, 12, 16, 14)
         clay.setSpacing(theme.SPACE_SM)
 
+        # --- Mode selector: a segmented control, not a second window (design
+        # change map). Idle-only, same enable/disable lifecycle as the
+        # preset combo (see _start_listening/_on_worker_finished) - "Must
+        # hold: Mode/preset switching stays idle-only". Placed above the
+        # chips row per the design's UI section. ---
+        mode_row = QHBoxLayout()
+        mode_row.setSpacing(0)
+        self.assistant_mode_btn = QPushButton("🧠 Asistente")
+        self.assistant_mode_btn.setObjectName("segmentleft")
+        self.assistant_mode_btn.setCheckable(True)
+        self.assistant_mode_btn.setCursor(Qt.PointingHandCursor)
+        self.translator_mode_btn = QPushButton("🌐 Traductor")
+        self.translator_mode_btn.setObjectName("segmentright")
+        self.translator_mode_btn.setCheckable(True)
+        self.translator_mode_btn.setCursor(Qt.PointingHandCursor)
+        self.mode_group = QButtonGroup(self)
+        self.mode_group.setExclusive(True)
+        self.mode_group.addButton(self.assistant_mode_btn)
+        self.mode_group.addButton(self.translator_mode_btn)
+        is_translator = self.settings.mode == "translator"
+        self.assistant_mode_btn.setChecked(not is_translator)
+        self.translator_mode_btn.setChecked(is_translator)
+        self.assistant_mode_btn.clicked.connect(lambda: self._on_mode_changed("assistant"))
+        self.translator_mode_btn.clicked.connect(lambda: self._on_mode_changed("translator"))
+        mode_row.addWidget(self.assistant_mode_btn)
+        mode_row.addWidget(self.translator_mode_btn)
+        mode_row.addStretch()
+        clay.addLayout(mode_row)
+
         # --- Prompt header: says what this is, and offers a way out to a real
         # editing surface when the briefing is longer than a glance ---
+        # Grouped in its own widget (Assistant-only, per spec's "User picks
+        # Translator" scenario: context box/preset combo/length chip
+        # disappear) so _apply_mode_visibility can show/hide it in one call.
+        self.assistant_context_widget = QWidget()
+        actx_lay = QVBoxLayout(self.assistant_context_widget)
+        actx_lay.setContentsMargins(0, 0, 0, 0)
+        actx_lay.setSpacing(theme.SPACE_SM)
+
         ctx_row = QHBoxLayout()
         ctx_row.setSpacing(theme.SPACE_SM)
         ctx_label = QLabel("Contexto de la reunión")
@@ -1583,7 +1768,7 @@ class ChatWindow(QWidget):
         ctx_row.addWidget(ctx_label)
         ctx_row.addStretch()
         ctx_row.addWidget(expand_btn)
-        clay.addLayout(ctx_row)
+        actx_lay.addLayout(ctx_row)
 
         self.context_box = QTextEdit()
         self.context_box.setObjectName("contextbox")
@@ -1597,7 +1782,34 @@ class ChatWindow(QWidget):
         # divider up is what makes the prompt readable.
         self.context_box.setMinimumHeight(64)
         self.context_box.setPlainText(self.settings.context)
-        clay.addWidget(self.context_box, stretch=1)
+        actx_lay.addWidget(self.context_box, stretch=1)
+        clay.addWidget(self.assistant_context_widget, stretch=1)
+
+        # --- Translator-only: target-language picker replaces the context
+        # box (spec: "target-language and detected-language controls
+        # appear"). The detected-language + override control lives in the
+        # Live panel instead - see LivePanel.detected_row's own comment. ---
+        self.translator_target_widget = QWidget()
+        ttgt_lay = QVBoxLayout(self.translator_target_widget)
+        ttgt_lay.setContentsMargins(0, 0, 0, 0)
+        ttgt_lay.setSpacing(theme.SPACE_SM)
+        target_label = QLabel("Traducir hacia")
+        target_label.setObjectName("sectionlabel")
+        ttgt_lay.addWidget(target_label)
+        self.target_lang_combo = QComboBox()
+        self.target_lang_combo.setObjectName("chip")
+        self.target_lang_combo.setToolTip(
+            "Idioma al que se traduce lo que dice la otra persona"
+        )
+        for code, label in panel_labels.TRANSLATOR_TARGET_LANGUAGES:
+            self.target_lang_combo.addItem(f"🌐 {label}", code)
+        idx = self.target_lang_combo.findData(self.settings.translator_target)
+        self.target_lang_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.target_lang_combo.currentIndexChanged.connect(self._on_target_lang_changed)
+        ttgt_lay.addWidget(self.target_lang_combo)
+        ttgt_lay.addStretch()
+        clay.addWidget(self.translator_target_widget, stretch=1)
+        self.translator_target_widget.hide()  # shown by _apply_mode_visibility
 
         # Chips row: the few knobs that change per call, inline like a model picker.
         chips = QHBoxLayout()
@@ -1606,6 +1818,7 @@ class ChatWindow(QWidget):
         # Preset combo: which role prompt + answer language the AI uses.
         # Full create/rename/duplicate/delete/restore lives in the editor
         # dialog opened by the button right next to it (slice 5).
+        # Assistant-only (spec: hidden in Translator mode).
         self.preset_combo = QComboBox()
         self.preset_combo.setObjectName("chip")
         self.preset_combo.setToolTip(
@@ -1626,6 +1839,10 @@ class ChatWindow(QWidget):
         self.device_combo.setToolTip("Qué salida de audio escuchar")
         self._populate_devices()
 
+        # Capture style (record-until-send vs. VAD-per-pause). Assistant-only:
+        # Translator is always continuous/VAD-driven (spec: "no send step"),
+        # so this chip is meaningless there and _start_listening forces
+        # "auto" capture for Translator regardless of what this remembers.
         self.mode_combo = QComboBox()
         self.mode_combo.setObjectName("chip")
         self.mode_combo.addItem("✋ Controlado", "controlled")
@@ -1640,8 +1857,10 @@ class ChatWindow(QWidget):
             lambda: self._set("listen_mode", self._selected_mode())
         )
 
-        length_label = QLabel("✂️")
-        length_label.setToolTip("Respuestas cortas / detalladas")
+        # Answer-length chip: Assistant-only (spec: hidden in Translator
+        # mode - a translation has no "short/detailed" knob).
+        self.length_label = QLabel("✂️")
+        self.length_label.setToolTip("Respuestas cortas / detalladas")
         self.length_switch = ToggleSwitch()
         self.length_switch.setChecked(self._answer_length == "detailed")
         self.length_switch.setToolTip(
@@ -1656,10 +1875,11 @@ class ChatWindow(QWidget):
         chips.addWidget(self.device_combo, stretch=2)
         chips.addWidget(self.mode_combo, stretch=1)
         chips.addStretch()
-        chips.addWidget(length_label)
+        chips.addWidget(self.length_label)
         chips.addWidget(self.length_switch)
         chips.addWidget(self.length_hint)
         clay.addLayout(chips)
+        self._apply_mode_visibility(self.settings.mode)
 
         # --- Primary action ---
         action_row = QHBoxLayout()
@@ -1732,6 +1952,115 @@ class ChatWindow(QWidget):
 
     def _selected_device(self) -> dict | None:
         return self.device_combo.currentData()
+
+    # ------------------------------------------------------------- call mode
+    def _call_mode(self) -> str:
+        return "translator" if self.translator_mode_btn.isChecked() else "assistant"
+
+    def _apply_mode_visibility(self, mode: str) -> None:
+        """Per-mode composer content (spec's "User picks Translator" /
+        "Per-mode chat window and Live panel content" scenarios)."""
+        is_translator = mode == "translator"
+        self.assistant_context_widget.setVisible(not is_translator)
+        self.translator_target_widget.setVisible(is_translator)
+        self.preset_combo.setVisible(not is_translator)
+        self.edit_presets_btn.setVisible(not is_translator)
+        self.mode_combo.setVisible(not is_translator)  # capture style: Assistant-only
+        self.length_label.setVisible(not is_translator)
+        self.length_switch.setVisible(not is_translator)
+        self.length_hint.setVisible(not is_translator)
+
+    def _on_mode_changed(self, mode: str) -> None:
+        self._set("mode", mode)
+        self._apply_mode_visibility(mode)
+
+    def _on_target_lang_changed(self, _index: int) -> None:
+        code = self.target_lang_combo.currentData()
+        if not code:
+            return
+        self._set("translator_target", code)
+        self._prewarm_translator_pair(code)
+
+    def _prewarm_translator_pair(self, target_code: str) -> None:
+        """Pre-warm the Argos pair the moment enough is known to resolve
+        one - NEVER when the user presses Escuchar (design PINNED DECISION
+        3: "never when they press Escuchar", proposal risk 4). Only the
+        target is known at this point; a source is only available if the
+        user already overrode it in a previous session
+        (settings.translator_source_override survives across sessions).
+        Otherwise nothing to warm yet - the real warm-up happens the moment
+        the source locks or is overridden mid-session (_on_source_override).
+        """
+        if not self._models_loaded or self.translator is None:
+            return
+        source_code = self.settings.translator_source_override
+        if not source_code or source_code == target_code:
+            return
+        self._run_pair_installer(source_code, target_code)
+
+    def _run_pair_installer(self, from_code: str, to_code: str) -> None:
+        """Off-thread install (design PINNED DECISION 3), held on self so Qt
+        cannot garbage-collect the QThread mid-download (known issue from
+        the slice 6 review - PairInstaller existed since slice 6 but was
+        never wired into anything that could hit this until now)."""
+        if self.translator is None:
+            return  # models not loaded yet - nothing to install with
+        if self._pair_installer is not None and self._pair_installer.isRunning():
+            return  # one install at a time; the next trigger re-checks anyway
+        self._pair_installer = PairInstaller(self.translator, from_code, to_code)
+        # Mid-call this button reads "Detener" and is the only way to stop
+        # the call; disabling it for a background download would trap the
+        # user in the session.
+        if not self._translator_session_active():
+            self.listen_btn.setEnabled(False)
+        self._pair_installer.progress.connect(self.status_label.setText)
+        self._pair_installer.done.connect(self._on_pair_installed)
+        self._pair_installer.start()
+
+    def _on_pair_installed(self, ok: bool, message: str) -> None:
+        self.status_label.setText(message)
+        if not ok:
+            # The status line is overwritten by the worker moments later, so
+            # a failure announced only there is a failure nobody sees.
+            self.chat.add_system(
+                f"⚠️ No se pudo preparar la traducción: {message}"
+            )
+        # Never re-enable while a call is actually running (_start_listening
+        # already disabled it for its own reasons); otherwise this was a
+        # composer-time pre-warm and the button should go back to normal.
+        if self._models_loaded and not (self.worker and self.worker.isRunning()):
+            self.listen_btn.setEnabled(True)
+
+    def _translator_available(self) -> tuple[bool, str]:
+        """Whether the Argos-backed translation engine can even be reached
+        (spec's "Argos unavailable" scenario, task 7.9). Checked at
+        _start_listening time - before a Translator session starts, not
+        discovered mid-call - so Assistant mode is unaffected either way."""
+        try:
+            import argostranslate.translate  # noqa: F401
+        except Exception as exc:  # noqa: BLE001 - any import/init failure counts
+            return False, str(exc)
+        return True, ""
+
+    def _translator_session_active(self) -> bool:
+        return bool(self.worker and self.worker.isRunning())
+
+    def _on_source_override(self, code: str) -> None:
+        """Live panel's "detected language - change" control (spec's
+        resolved question #3). Wins immediately and permanently for this
+        session (LanguageLock.override's own contract) and is remembered so
+        a LATER session's target-language pick can pre-warm ahead of time."""
+        self.lock.override(code)
+        # Only a RUNNING translator session may pin Whisper: the strategy
+        # captured the previous value and restores it in close(). Setting it
+        # from an idle panel leaves it pinned with nobody to put it back,
+        # and every later assistant call transcribes in the wrong language
+        # until the app restarts.
+        if self.transcriber is not None and self._translator_session_active():
+            self.transcriber.language = code
+        self._set("translator_source_override", code)
+        self.panel.set_detected_language(code, manual=True)
+        self._run_pair_installer(code, self.settings.translator_target)
 
     def _populate_presets(self) -> None:
         """Fill the preset combo from self.presets, selecting the active one.
@@ -1842,10 +2171,13 @@ class ChatWindow(QWidget):
         if self._processing:
             self._cancel_send()
         elif self.worker and self.worker.isRunning():
-            if self._selected_mode() == "controlled":
-                self._send_now()
-            else:
+            # Translator's capture is always forced to "auto"/continuous
+            # (see _start_listening) regardless of what mode_combo
+            # remembers, so it always stops rather than sends.
+            if self._call_mode() == "translator" or self._selected_mode() != "controlled":
                 self._stop_listening()
+            else:
+                self._send_now()
         else:
             self._start_listening()
 
@@ -1859,38 +2191,78 @@ class ChatWindow(QWidget):
         if self._viewing is not None:
             self._new_conversation()
 
-        context = self.context_box.toPlainText().strip()
-        self._set("context", context)
-
         device = self._selected_device()
         if device:
             self._set("device_name", device["name"])
-        mode = self._selected_mode()
 
-        # Update the briefing but KEEP memory, so pause/resume doesn't lose
-        # context. Memory is only cleared when a new conversation is started
-        # (this call moved here from CopilotWorker.run(), which is now
-        # engine-blind; same timing, before the worker thread starts).
-        self.brain.set_context(context)
+        call_mode = self._call_mode()
+        self.convo.mode = call_mode
 
-        listener = Listener(
-            self.transcriber, device_index=device["index"] if device else None
-        )
-        active_preset = self._selected_preset()
-        strategy = AssistantStrategy(
-            active_preset, self.brain, self.translator, self.usage,
-            # No double translation: skip Argos entirely when the preset's
-            # own answer language already equals the configured translator
-            # target (spec: "No double translation when preset already
-            # answers in target language"). For an unmodified install this
-            # still resolves to "es" - General answers in English and
-            # settings.translator_target defaults to "es" - so v1.0.0's
-            # hardcoded "es" behavior is unchanged.
-            translate_answer_to=presets.translate_target(
-                active_preset, self.settings.translator_target
-            ),
-        )
-        self.worker = CopilotWorker(listener, strategy, mode)
+        if call_mode == "translator":
+            # spec's "Argos unavailable" scenario (task 7.9): checked BEFORE
+            # starting anything, so a broken/missing argostranslate install
+            # never gets past "no crash, Assistant mode remains usable".
+            available, detail = self._translator_available()
+            if not available:
+                QMessageBox.warning(
+                    self,
+                    "Traducción no disponible",
+                    "El motor de traducción offline (Argos) no está "
+                    f"disponible en este equipo:\n\n{detail}\n\n"
+                    "El modo Asistente sigue funcionando con normalidad.",
+                )
+                return
+            self.convo.preset_id = ""
+            self._pivot_warning_shown = False
+            self._last_detected_lang = ""
+            # "Reset only happens at _start_listening (new session)" - the
+            # design's own rule for LanguageLock; a manual override from a
+            # PREVIOUS session is still honored via translator_source_override
+            # feeding _prewarm_translator_pair, but the lock itself always
+            # starts this session unlocked.
+            self.lock.reset()
+            listener = Listener(
+                self.transcriber, device_index=device["index"] if device else None
+            )
+            strategy = TranslatorStrategy(
+                self.translator, self.transcriber, self.settings.translator_target, self.lock
+            )
+            capture_mode = "auto"  # continuous, VAD-triggered - spec: "no send step"
+            self.panel.set_mode("translator")
+            self.panel.set_listening_continuous()
+        else:
+            context = self.context_box.toPlainText().strip()
+            self._set("context", context)
+            active_preset = self._selected_preset()
+            self.convo.preset_id = active_preset.id
+
+            # Update the briefing but KEEP memory, so pause/resume doesn't lose
+            # context. Memory is only cleared when a new conversation is started
+            # (this call moved here from CopilotWorker.run(), which is now
+            # engine-blind; same timing, before the worker thread starts).
+            self.brain.set_context(context)
+
+            listener = Listener(
+                self.transcriber, device_index=device["index"] if device else None
+            )
+            strategy = AssistantStrategy(
+                active_preset, self.brain, self.translator, self.usage,
+                # No double translation: skip Argos entirely when the preset's
+                # own answer language already equals the configured translator
+                # target (spec: "No double translation when preset already
+                # answers in target language"). For an unmodified install this
+                # still resolves to "es" - General answers in English and
+                # settings.translator_target defaults to "es" - so v1.0.0's
+                # hardcoded "es" behavior is unchanged.
+                translate_answer_to=presets.translate_target(
+                    active_preset, self.settings.translator_target
+                ),
+            )
+            capture_mode = self._selected_mode()
+            self.panel.set_mode("assistant")
+            self.panel.set_listening()
+
+        self.worker = CopilotWorker(listener, strategy, capture_mode)
         self.worker.utterance_detected.connect(self._on_utterance)
         self.worker.partial_text.connect(self._on_partial)
         self.worker.output_chunk.connect(self._on_chunk)
@@ -1907,13 +2279,16 @@ class ChatWindow(QWidget):
         self.mode_combo.setEnabled(False)
         # Idle-only, like the capture mode: the strategy reads its preset
         # once at start(), so a switch mid-call would change the label
-        # without changing a single answer.
+        # without changing a single answer. Same idiom now covers the
+        # Assistant/Translator selector itself.
         self.preset_combo.setEnabled(False)
         self.edit_presets_btn.setEnabled(False)
+        self.assistant_mode_btn.setEnabled(False)
+        self.translator_mode_btn.setEnabled(False)
+        self.target_lang_combo.setEnabled(False)
         self.listen_btn.setText(
-            "■  Enviar y responder" if mode == "controlled" else "■  Detener"
+            "■  Enviar y responder" if capture_mode == "controlled" else "■  Detener"
         )
-        self.panel.set_listening()
         self.panel.show()
         self.panel.raise_()
 
@@ -1968,6 +2343,9 @@ class ChatWindow(QWidget):
         self.mode_combo.setEnabled(True)
         self.preset_combo.setEnabled(True)
         self.edit_presets_btn.setEnabled(True)
+        self.assistant_mode_btn.setEnabled(True)
+        self.translator_mode_btn.setEnabled(True)
+        self.target_lang_combo.setEnabled(True)
         self.listen_btn.setEnabled(True)
         self.listen_btn.setText("●  Escuchar la llamada")
         self.panel.set_done()
@@ -1977,7 +2355,7 @@ class ChatWindow(QWidget):
             self.panel.state_label.setText("✕ Envío cancelado")
         else:
             self.status_label.setText("Listo")
-            self.panel.state_label.setText("✅ Respuesta lista")
+            self.panel.state_label.setText(self.panel.label("state_done"))
 
     def _close_panel(self) -> None:
         self.panel.hide()
@@ -1989,8 +2367,11 @@ class ChatWindow(QWidget):
         self._last_heard = text
         self.chat.add_question(text)
         self.panel.heard_label.setText(f"👂 {text}")
-        self.panel.answer_box.clear()
-        self.panel.set_translation("")
+        if self._call_mode() != "translator":
+            # Translator's Live panel is continuous (design change map): each
+            # utterance appends a line rather than clearing what came before.
+            self.panel.answer_box.clear()
+            self.panel.set_translation("")
 
     def _on_partial(self, text: str) -> None:
         self._last_heard = text
@@ -2005,8 +2386,11 @@ class ChatWindow(QWidget):
         self.panel.answer_box.ensureCursorVisible()
 
     def _on_result(self, result) -> None:
-        # Re-setting the same bytes the strategy streamed; the translator
-        # engine never streams, so this is where its output lands.
+        if self._call_mode() == "translator":
+            self._on_translator_result(result)
+            return
+        # Re-setting the same bytes the strategy streamed; kept exactly as
+        # it was before this slice - the Assistant path is untouched.
         self.chat.set_answer(result.primary)
         # v1.0.0 only produced a translation bubble when the model actually
         # answered. Gating on `answer` (never on `primary`, which also holds
@@ -2026,14 +2410,54 @@ class ChatWindow(QWidget):
             self._refresh_history_list()
             self._refresh_recents()
 
+    def _on_translator_result(self, result) -> None:
+        """Continuous Translator state: each EngineResult is its own line,
+        never a click-to-send exchange (spec: "no send step")."""
+        self.chat.set_answer(result.primary)
+
+        if result.source_language and result.source_language != self._last_detected_lang:
+            self._last_detected_lang = result.source_language
+            self.panel.set_detected_language(result.source_language)
+
+        # The pivot-quality warning must never be silent (design PINNED
+        # DECISION 3 / task 7.8) but must also not nag on every line (known
+        # issue from the slice 6 review) - shown once per session.
+        if result.route_kind == "pivot" and not self._pivot_warning_shown:
+            self._pivot_warning_shown = True
+            self.chat.add_system(
+                "⚠️ Traduciendo vía inglés (pivote): puede tardar más y "
+                "perder algo de calidad."
+            )
+
+        if result.error:
+            self.chat.add_system(f"⚠️ {result.error}")
+            return  # nothing real to persist or append to the Live panel
+
+        if not result.primary:
+            return  # still detecting the source language; nothing heard yet
+
+        self.panel.append_translation_line(result.primary)
+        first_line = not self.convo.exchanges
+        self.convo.exchanges.append(
+            conversations.translator_exchange(
+                heard_text=result.source,
+                detected_source_language=result.source_language,
+                translated_text=result.primary,
+                target_language=result.primary_language,
+            )
+        )
+        conversations.save(self.convo)
+        # Only the first line changes the sidebar: a translated line arrives
+        # every couple of seconds, and re-reading every saved call from disk
+        # that often freezes the window in the middle of the call.
+        if not first_line:
+            return
+        self._refresh_history_list()
+        self._refresh_recents()
+
     def _on_hearing(self, state: str) -> None:
-        messages = {
-            "idle": "🎧 Escuchando la llamada...",
-            "speech": "🎤 La otra persona está hablando...",
-            "capturing": "🔴 Grabando... pulsa «Enviar» cuando termine la pregunta.",
-            "transcribing": "🧠 Entendiendo lo que dijo...",
-        }
-        self.panel.state_label.setText(messages.get(state, "🎧 En vivo"))
+        labels = panel_labels.labels_for(self._call_mode())
+        self.panel.state_label.setText(labels["hearing"].get(state, labels["header"]))
 
     def _update_usage_label(self, count: int) -> None:
         self.usage_label.setText(f"📨 ~{count} pedidos hoy (est.)")
@@ -2050,7 +2474,9 @@ class ChatWindow(QWidget):
     def _refresh_history_list(self) -> None:
         self.history_list.clear()
         for i, entry in enumerate(self._shown):
-            question = entry.get("question", "")
+            # Translator exchanges use "heard_text", not "question" - see
+            # conversations.translator_exchange's shape.
+            question = entry.get("question") or entry.get("heard_text", "")
             item = QListWidgetItem(f"{i + 1}. {question}")
             item.setToolTip(question)
             item.setData(Qt.UserRole, i)
@@ -2164,11 +2590,19 @@ class ChatWindow(QWidget):
         self._refresh_recents()
 
     def _render(self, exchanges: list[dict]) -> None:
-        """Repaint the transcript from stored exchanges."""
+        """Repaint the transcript from stored exchanges.
+
+        Reads both exchange shapes: Assistant's question/answer/translation
+        and Translator's heard_text/translated_text (spec's resolved
+        question #2) - a saved call is read back the same way regardless of
+        which engine produced it.
+        """
         self.chat.clear()
         for entry in exchanges:
-            self.chat.add_question(entry.get("question", ""))
-            self.chat.append_answer(entry.get("answer", ""))
+            heard = entry.get("question") or entry.get("heard_text", "")
+            answer = entry.get("answer") or entry.get("translated_text", "")
+            self.chat.add_question(heard)
+            self.chat.append_answer(answer)
             translation = entry.get("translation", "")
             if translation:
                 self.chat.set_translation(translation)
@@ -2211,6 +2645,11 @@ class ChatWindow(QWidget):
         _write_geometry(PANEL_GEOMETRY_FILE, self.panel)
         conversations.save(self.convo)
         self._stop_listening()
+        # Held on self precisely so it survives to be waited on here too -
+        # otherwise Qt logs "QThread: Destroyed while thread is still
+        # running" (or worse) for an in-flight pre-warm download.
+        if self._pair_installer is not None and self._pair_installer.isRunning():
+            self._pair_installer.wait(3000)
         self.panel.close()
         event.accept()
 

@@ -17,6 +17,7 @@ why, verified empirically against argostranslate 1.11.0.
 """
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from typing import Callable
 
@@ -126,6 +127,16 @@ class Translator:
         # invalidation would lie. No disk cache - the ground truth (what's
         # actually installed) can change outside the app between runs.
         self._routes: dict[tuple[str, str], Route] = {}
+        # Slice 7 gotcha (known issue from the slice 6 review): PairInstaller
+        # runs `ensure_route` on its own QThread while the worker thread may
+        # ALSO resolve/install a route (AssistantStrategy.start(),
+        # TranslatorStrategy.process()) - both read/mutate `self._routes`.
+        # A plain re-entrant lock around resolve()/ensure_route() is enough:
+        # ensure_route() calls self.resolve() internally on the same thread,
+        # so the lock must be reentrant, not a plain Lock. Do NOT reuse this
+        # pattern for listener.py's `_model_lock` - that one's non-blocking
+        # acquire contract is deliberately different and must stay untouched.
+        self._lock = threading.RLock()
 
     def _installed_languages(self):
         import argostranslate.translate
@@ -133,10 +144,11 @@ class Translator:
         return argostranslate.translate.get_installed_languages()
 
     def resolve(self, from_code: str, to_code: str) -> Route:
-        key = (from_code, to_code)
-        if key not in self._routes:
-            self._routes[key] = resolve_route(self._installed_languages(), from_code, to_code)
-        return self._routes[key]
+        with self._lock:
+            key = (from_code, to_code)
+            if key not in self._routes:
+                self._routes[key] = resolve_route(self._installed_languages(), from_code, to_code)
+            return self._routes[key]
 
     def ensure_route(
         self,
@@ -154,51 +166,60 @@ class Translator:
         Raises PackageIndexError / PackageUnavailable / PackageInstallError
         instead of printing (the v1.0.0 code printed into a pythonw process
         with no console - a silent failure nobody could ever see).
+
+        Holds the same re-entrant lock resolve() uses for its whole body -
+        including the network download - so PairInstaller (its own QThread)
+        and a strategy resolving/installing on the worker thread never race
+        on `self._routes` (slice 7 known-issue fix; see __init__'s comment).
+        This serializes installs, which is the point: two callers racing to
+        install the same missing pair must not both hit the network.
         """
 
         def status(message: str) -> None:
             if on_status is not None:
                 on_status(message)
 
-        route = self.resolve(from_code, to_code)
-        if route.kind != "unavailable":
-            return route
+        with self._lock:
+            route = self.resolve(from_code, to_code)
+            if route.kind != "unavailable":
+                return route
 
-        status("Actualizando el índice de paquetes de traducción...")
-        import argostranslate.package
+            status("Actualizando el índice de paquetes de traducción...")
+            import argostranslate.package
 
-        try:
-            argostranslate.package.update_package_index()
-            available = argostranslate.package.get_available_packages()
-        except Exception as exc:  # noqa: BLE001
-            raise PackageIndexError(str(exc)) from exc
-
-        packages = self._packages_for_route(available, from_code, to_code)
-        if not packages:
-            raise PackageUnavailable(
-                f"No hay paquete directo ni pivote via {PIVOT} disponible para "
-                f"{from_code}->{to_code}."
-            )
-
-        for pkg in packages:
-            status(f"Descargando paquete de traducción {pkg.from_code}->{pkg.to_code}...")
             try:
-                argostranslate.package.install_from_path(pkg.download())
+                argostranslate.package.update_package_index()
+                available = argostranslate.package.get_available_packages()
             except Exception as exc:  # noqa: BLE001
-                raise PackageInstallError(str(exc)) from exc
+                raise PackageIndexError(str(exc)) from exc
 
-        # A successful install can open up routes for OTHER pairs too (e.g.
-        # installing en->de also enables an es->de pivot) - clearing the
-        # whole cache, not just this key, is the only way that stays honest.
-        self._routes.clear()
+            packages = self._packages_for_route(available, from_code, to_code)
+            if not packages:
+                raise PackageUnavailable(
+                    f"No hay paquete directo ni pivote via {PIVOT} disponible para "
+                    f"{from_code}->{to_code}."
+                )
 
-        route = self.resolve(from_code, to_code)
-        if route.kind == "unavailable":
-            raise PackageUnavailable(
-                f"Los paquetes se instalaron pero {from_code}->{to_code} sigue sin "
-                "ruta disponible."
-            )
-        return route
+            for pkg in packages:
+                status(f"Descargando paquete de traducción {pkg.from_code}->{pkg.to_code}...")
+                try:
+                    argostranslate.package.install_from_path(pkg.download())
+                except Exception as exc:  # noqa: BLE001
+                    raise PackageInstallError(str(exc)) from exc
+
+            # A successful install can open up routes for OTHER pairs too
+            # (e.g. installing en->de also enables an es->de pivot) -
+            # clearing the whole cache, not just this key, is the only way
+            # that stays honest.
+            self._routes.clear()
+
+            route = self.resolve(from_code, to_code)
+            if route.kind == "unavailable":
+                raise PackageUnavailable(
+                    f"Los paquetes se instalaron pero {from_code}->{to_code} sigue "
+                    "sin ruta disponible."
+                )
+            return route
 
     @staticmethod
     def _packages_for_route(available, from_code: str, to_code: str):

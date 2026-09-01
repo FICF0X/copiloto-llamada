@@ -8,6 +8,7 @@ No argostranslate, no faster-whisper, no google.genai, no Qt.
 from __future__ import annotations
 
 import inspect
+from types import SimpleNamespace
 
 from src.engines.base import EngineCallbacks, Utterance
 from src.engines.translation import TranslatorStrategy
@@ -15,11 +16,20 @@ from src.language_lock import LanguageLock
 
 
 class FakeTranslator:
-    def __init__(self, translate_result: str = "[translated]", ensure_route_exc: Exception | None = None):
+    def __init__(
+        self,
+        translate_result: str = "[translated]",
+        ensure_route_exc: Exception | None = None,
+        route_kind: str = "direct",
+    ):
         self.ensure_route_calls: list[tuple[str, str]] = []
         self.translate_calls: list[tuple[str, str, str]] = []
         self.ensure_route_exc = ensure_route_exc
         self.translate_result = translate_result
+        # Mirrors the real Translator.ensure_route()'s Route return - only
+        # `.kind` is read by the strategy (task 7.8's route-kind plumbing),
+        # so a SimpleNamespace stands in rather than importing src.translator.
+        self.route_kind = route_kind
 
     def ensure_route(self, from_code, to_code, on_status=None):
         self.ensure_route_calls.append((from_code, to_code))
@@ -27,7 +37,7 @@ class FakeTranslator:
             on_status("Preparando traduccion...")
         if self.ensure_route_exc is not None:
             raise self.ensure_route_exc
-        return object()  # Route is opaque to the strategy
+        return SimpleNamespace(kind=self.route_kind)
 
     def translate(self, text, from_code, to_code):
         self.translate_calls.append((text, from_code, to_code))
@@ -237,7 +247,66 @@ def test_ensure_route_status_callback_is_forwarded_to_on_status():
 # --- close() ------------------------------------------------------------------
 
 
-def test_close_is_a_noop():
+# --- Route-kind plumbing (task 7.8: the pivot-quality warning has nothing
+# to render until EngineResult carries the resolved route's kind) ----------
+
+
+def test_route_kind_is_surfaced_on_a_successful_direct_result():
+    translator = FakeTranslator(translate_result="hola", route_kind="direct")
+    lock = LanguageLock()
+    lock.override("fr")
+    strategy = TranslatorStrategy(translator, FakeTranscriber(), "es", lock)
+    cb, _ = make_callbacks()
+
+    result = strategy.process(Utterance("bonjour", "fr", 0.95), cb)
+
+    assert result.route_kind == "direct"
+
+
+def test_route_kind_is_surfaced_and_never_silent_on_a_pivot_result():
+    translator = FakeTranslator(translate_result="hallo", route_kind="pivot")
+    lock = LanguageLock()
+    lock.override("fr")
+    strategy = TranslatorStrategy(translator, FakeTranscriber(), "de", lock)
+    cb, _ = make_callbacks()
+
+    result = strategy.process(Utterance("bonjour", "fr", 0.95), cb)
+
+    assert result.route_kind == "pivot"
+
+
+def test_route_kind_is_cached_and_not_rechecked_every_utterance():
+    """Matches ensure_route's own once-per-session contract: the route's
+    kind is resolved once, then reused - never re-derived from a second
+    ensure_route call, which the existing 'resolved once per session' test
+    already proves doesn't happen."""
+    translator = FakeTranslator(translate_result="hola", route_kind="pivot")
+    lock = LanguageLock()
+    lock.override("fr")
+    strategy = TranslatorStrategy(translator, FakeTranscriber(), "es", lock)
+    cb, _ = make_callbacks()
+
+    first = strategy.process(Utterance("bonjour", "fr", 0.95), cb)
+    second = strategy.process(Utterance("bonsoir", "fr", 0.95), cb)
+
+    assert first.route_kind == second.route_kind == "pivot"
+    assert len(translator.ensure_route_calls) == 1
+
+
+def test_route_kind_is_empty_while_still_unlocked():
+    translator = FakeTranslator()
+    lock = LanguageLock(min_probability=0.70, min_votes=2)
+    strategy = TranslatorStrategy(translator, FakeTranscriber(), "es", lock)
+    cb, _ = make_callbacks()
+
+    result = strategy.process(Utterance("bonjour", "fr", 0.30), cb)
+
+    assert result.route_kind == ""
+
+
+def test_close_is_safe_without_a_session():
+    """close() restores the borrowed language; it must not blow up when no
+    session ever started."""
     strategy = TranslatorStrategy(FakeTranslator(), FakeTranscriber(), "es", LanguageLock())
     strategy.close()  # must not raise
 
@@ -260,3 +329,23 @@ def test_closing_hands_whisper_back_the_language_it_had():
 
     strategy.close()
     assert transcriber.language == "en", "and gives it back when it ends"
+
+
+def test_changing_the_source_mid_session_resolves_the_new_pair():
+    """A manual override changes the pair, so the route must be resolved again.
+
+    Caching on "have we resolved once" meant the new pair was never
+    installed: translate() then returned its unavailable placeholder and the
+    UI recorded that string into the saved call as if it were a translation.
+    """
+    translator = FakeTranslator()
+    lock = LanguageLock()
+    lock.override("en")
+    strategy = TranslatorStrategy(translator, FakeTranscriber(), "es", lock)
+    cb, _ = make_callbacks()
+
+    strategy.process(Utterance("hello", "en", 0.95), cb)
+    lock.override("fr")
+    strategy.process(Utterance("bonjour", "fr", 0.95), cb)
+
+    assert translator.ensure_route_calls == [("en", "es"), ("fr", "es")]

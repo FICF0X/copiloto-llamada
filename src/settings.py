@@ -70,7 +70,7 @@ def load() -> Settings:
 
     return Settings(
         schema=raw.get("schema", SCHEMA_VERSION),
-        mode=raw.get("mode", "assistant"),
+        mode=_valid_mode(raw.get("mode", "assistant")),
         preset_id=raw.get("preset_id", ""),
         context=raw.get("context", ""),
         device_name=raw.get("device_name", ""),
@@ -91,6 +91,15 @@ def _valid_length(value: str) -> str:
 def _valid_listen_mode(value: str) -> str:
     """Capture style, defaulting the way the app has always defaulted it."""
     return (value or "").strip() or "controlled"
+
+
+def _valid_mode(value: str) -> str:
+    """Call mode (task 7.1's mode resolution): "assistant" or "translator",
+    same validate-with-fallback shape as _valid_length/_valid_listen_mode -
+    a hand-edited or corrupt settings.json must never crash the app or land
+    on an unrecognized mode string the composer's mode selector can't render."""
+    value = (value or "").strip()
+    return value if value in ("assistant", "translator") else "assistant"
 
 
 def save(s: Settings) -> None:

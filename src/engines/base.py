@@ -36,6 +36,10 @@ class EngineResult:
     secondary: str = ""  # Assistant: ES translation of the answer, or "". Translator: always ""
     source_language: str = ""  # detected/locked source (Translator), "" for Assistant
     primary_language: str = ""  # preset answer language / translator target
+    route_kind: str = ""  # Translator only: "direct" | "pivot" | "" (Assistant,
+    # or Translator before a route has resolved). Surfaced so the UI can show
+    # the pivot-quality warning (slice 7 task 7.8) - the warning must never be
+    # silent, but the UI is responsible for not repeating it on every line.
     answer: str = ""  # the engine's own output, WITHOUT any error copy:
     # this is what gets translated and saved. v1.0.0 gated persistence on
     # exactly this value, so an answer that streamed and then failed is
