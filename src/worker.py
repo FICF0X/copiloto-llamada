@@ -1,28 +1,28 @@
 """The background thread that runs a call.
 
-listen -> transcribe -> answer -> translate, off the UI thread. Everything it
-learns is published as Qt signals, so a window can render the call without
-knowing anything about audio, Whisper or Gemini.
+listen -> transcribe -> delegate to an EngineStrategy, off the UI thread.
+Everything it learns is published as Qt signals, so a window can render the
+call without knowing anything about audio, Whisper, Gemini or Argos.
+
+The worker holds NO engine-specific branches: `strategy.kind` is label data,
+never branched on here. What happens to a transcribed utterance is entirely
+the injected EngineStrategy's decision.
 """
 from __future__ import annotations
 
 from PySide6.QtCore import QThread, Signal
 
-from src.brain import Brain
+from src.engines.base import EngineCallbacks, EngineStrategy, Utterance
 from src.listener import Listener
-from src.translator import Translator
-from src.usage import UsageTracker
 
 
 class CopilotWorker(QThread):
-    """Runs the listen -> transcribe -> answer -> translate loop off the UI thread."""
+    """Runs the listen -> transcribe -> delegate loop off the UI thread."""
 
-    question_detected = Signal(str)
+    utterance_detected = Signal(str)  # renamed from question_detected
     partial_text = Signal(str)  # live transcription of what's being heard right now
-    answer_chunk = Signal(str)
-    answer_done = Signal()
-    translation_ready = Signal(str)
-    exchange_recorded = Signal(str, str, str)  # question, answer, translation
+    output_chunk = Signal(str)  # renamed from answer_chunk; Translator never emits it
+    result_ready = Signal(object)  # carries an EngineResult
     hearing = Signal(str)  # live capture state: idle / speech / transcribing
     usage_updated = Signal(int)  # new estimated request count for today
     status = Signal(str)
@@ -30,26 +30,24 @@ class CopilotWorker(QThread):
     def __init__(
         self,
         listener: Listener,
-        brain: Brain,
-        translator: Translator,
-        usage: UsageTracker,
-        context: str = "",
+        strategy: EngineStrategy,
         mode: str = "auto",  # "auto" = VAD per-utterance, "controlled" = stop-to-send
     ) -> None:
         super().__init__()
         self.listener = listener
-        self.brain = brain
-        self.translator = translator
-        self.usage = usage
-        self.context = context
+        self.strategy = strategy
         self.mode = mode
         self.cancelled = False
+        self._cb = EngineCallbacks(
+            on_output=self.output_chunk.emit,
+            on_status=self.status.emit,
+            on_usage=self.usage_updated.emit,
+            is_cancelled=lambda: self.cancelled,
+        )
 
     def run(self) -> None:
         self.status.emit("Escuchando...")
-        # Update the briefing but KEEP memory, so pause/resume doesn't lose context.
-        # Memory is only cleared when a new conversation is started.
-        self.brain.set_context(self.context)
+        self.strategy.start()
         # Controlled mode records everything until the user stops, then sends one
         # prompt; auto mode fires on every VAD-detected pause.
         if self.mode == "controlled":
@@ -61,42 +59,22 @@ class CopilotWorker(QThread):
                 on_state=self.hearing.emit, on_partial=self.partial_text.emit
             )
         try:
-            for question in source:
+            for text in source:
                 if self.cancelled:
                     break
-                self.question_detected.emit(question)
-                self.status.emit("Pensando...")
-                # One answer = one real Gemini request. Count it (estimate).
-                self.usage_updated.emit(self.usage.record())
-                pieces: list[str] = []
-                try:
-                    for piece in self.brain.answer_stream(question):
-                        pieces.append(piece)
-                        self.answer_chunk.emit(piece)
-                except Exception as exc:  # noqa: BLE001
-                    detail = str(exc)
-                    if "RESOURCE_EXHAUSTED" in detail or "429" in detail:
-                        self.status.emit("⚠️ Límite de Gemini alcanzado")
-                        self.answer_chunk.emit(
-                            "\n⚠️ Alcanzaste el límite de pedidos de Gemini. "
-                            "Espera un minuto (límite por minuto) o prueba mañana "
-                            "(límite diario)."
-                        )
-                    else:
-                        self.answer_chunk.emit(f"\n[error al consultar la IA: {exc}]")
-                self.answer_done.emit()
-
-                # Translate the finished answer offline (no tokens). Whole-text
-                # translation only: partial sentences translate poorly.
-                answer = "".join(pieces).strip()
-                if answer:
-                    self.status.emit("Traduciendo...")
-                    translation = self.translator.translate(answer)
-                    self.translation_ready.emit(translation)
-                    self.exchange_recorded.emit(question, answer, translation)
+                utt = Utterance(
+                    text,
+                    self.listener.transcriber.last_language,
+                    self.listener.transcriber.last_language_probability,
+                )
+                self.utterance_detected.emit(utt.text)
+                result = self.strategy.process(utt, self._cb)
+                self.result_ready.emit(result)
                 self.status.emit("Escuchando...")
         except Exception as exc:  # noqa: BLE001
             self.status.emit(f"Error: {exc}")
+        finally:
+            self.strategy.close()
 
     def stop(self) -> None:
         """Finish the current capture and answer it."""

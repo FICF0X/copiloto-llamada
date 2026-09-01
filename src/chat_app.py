@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import ctypes
 import sys
+from types import SimpleNamespace
 
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtGui import (
@@ -63,6 +64,7 @@ from src.config import (
     ROOT,
     USAGE_FILE,
 )
+from src.engines.assistant import AssistantStrategy
 from src.listener import Listener
 from src.transcriber import Transcriber
 from src.translator import Translator
@@ -84,6 +86,12 @@ SPLIT_FILE = ROOT / "composer_split.txt"
 EDITOR_GEOMETRY_FILE = ROOT / "prompt_editor_geometry.txt"
 
 PANEL_DEFAULT = (60, 60, 460, 340)
+
+# Implicit "General" preset, used only in this slice: src/presets.py (slice 4)
+# will replace this with a real Preset loaded from presets.json. Reproduces
+# v1.0.0 exactly - context="", answer_language="en" - per the design's
+# byte-identical-v1.0.0 regression requirement.
+_GENERAL_PRESET = SimpleNamespace(id="general", context="", answer_language="en")
 
 
 def _read_geometry(path, fallback: tuple[int, int, int, int] | None = None):
@@ -401,6 +409,20 @@ class ChatView(QScrollArea):
             self._live_answer = Bubble("answer", "", self._font_pt)
             self._add(self._live_answer)
         self._live_answer.append(text)
+        self._scroll_to_bottom()
+
+    def set_answer(self, text: str) -> None:
+        """Set the answer bubble's full text idempotently.
+
+        Used with EngineResult.primary, which already equals everything
+        streamed via append_answer for the Assistant engine (a no-op
+        repaint) and fills a bubble that was never streamed into for engines
+        that don't stream (e.g. Translator).
+        """
+        if self._live_answer is None:
+            self._live_answer = Bubble("answer", "", self._font_pt)
+            self._add(self._live_answer)
+        self._live_answer.set_text(text)
         self._scroll_to_bottom()
 
     def set_translation(self, text: str) -> None:
@@ -1338,17 +1360,24 @@ class ChatWindow(QWidget):
             self._set("device_name", device["name"])
         mode = self._selected_mode()
 
+        # Update the briefing but KEEP memory, so pause/resume doesn't lose
+        # context. Memory is only cleared when a new conversation is started
+        # (this call moved here from CopilotWorker.run(), which is now
+        # engine-blind; same timing, before the worker thread starts).
+        self.brain.set_context(context)
+
         listener = Listener(
             self.transcriber, device_index=device["index"] if device else None
         )
-        self.worker = CopilotWorker(
-            listener, self.brain, self.translator, self.usage, context, mode
+        strategy = AssistantStrategy(
+            _GENERAL_PRESET, self.brain, self.translator, self.usage,
+            translate_answer_to="es",
         )
-        self.worker.question_detected.connect(self._on_question)
+        self.worker = CopilotWorker(listener, strategy, mode)
+        self.worker.utterance_detected.connect(self._on_utterance)
         self.worker.partial_text.connect(self._on_partial)
-        self.worker.answer_chunk.connect(self._on_chunk)
-        self.worker.translation_ready.connect(self._on_translation)
-        self.worker.exchange_recorded.connect(self._on_exchange_recorded)
+        self.worker.output_chunk.connect(self._on_chunk)
+        self.worker.result_ready.connect(self._on_result)
         self.worker.hearing.connect(self._on_hearing)
         self.worker.usage_updated.connect(self._update_usage_label)
         self.worker.status.connect(self.status_label.setText)
@@ -1432,7 +1461,7 @@ class ChatWindow(QWidget):
             self._stop_listening()
 
     # -------------------------------------------------------------- signals
-    def _on_question(self, text: str) -> None:
+    def _on_utterance(self, text: str) -> None:
         self._last_heard = text
         self.chat.add_question(text)
         self.panel.heard_label.setText(f"👂 {text}")
@@ -1451,9 +1480,27 @@ class ChatWindow(QWidget):
         self.panel.answer_box.insertPlainText(text)
         self.panel.answer_box.ensureCursorVisible()
 
-    def _on_translation(self, text: str) -> None:
-        self.chat.set_translation(text)
-        self.panel.set_translation(text)
+    def _on_result(self, result) -> None:
+        # Re-setting the same bytes the strategy streamed; the translator
+        # engine never streams, so this is where its output lands.
+        self.chat.set_answer(result.primary)
+        # v1.0.0 only produced a translation bubble when the model actually
+        # answered. Gating on `answer` (never on `primary`, which also holds
+        # error copy) keeps a failed call from appending an empty bubble and
+        # keeps a partially streamed answer in the saved call, as it was.
+        if result.answer:
+            self.chat.set_translation(result.secondary)
+            self.panel.set_translation(result.secondary)
+            self.convo.exchanges.append(
+                {
+                    "question": result.source,
+                    "answer": result.answer,
+                    "translation": result.secondary,
+                }
+            )
+            conversations.save(self.convo)
+            self._refresh_history_list()
+            self._refresh_recents()
 
     def _on_hearing(self, state: str) -> None:
         messages = {
@@ -1475,16 +1522,6 @@ class ChatWindow(QWidget):
             saved = conversations.load(self._viewing)
             return saved.exchanges if saved else []
         return self.convo.exchanges
-
-    def _on_exchange_recorded(self, question: str, answer: str, translation: str) -> None:
-        self.convo.exchanges.append(
-            {"question": question, "answer": answer, "translation": translation}
-        )
-        # Saved after every exchange, not on exit: a crash mid-call must not
-        # cost the transcript.
-        conversations.save(self.convo)
-        self._refresh_history_list()
-        self._refresh_recents()
 
     def _refresh_history_list(self) -> None:
         self.history_list.clear()

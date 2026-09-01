@@ -12,33 +12,18 @@ from google.genai import types
 
 from src import config
 from src.config import GEMINI_MODEL, GEMINI_TIMEOUT_MS, MAX_HISTORY_MESSAGES, validate
-
-SYSTEM_PROMPT = (
-    "You are a real-time copilot helping the user answer questions during a live "
-    "video call. You receive a transcription of what the other person said. "
-    "Give a clear, accurate, ready-to-use answer the user can say out loud. "
-    "You may also receive MEETING CONTEXT describing the topic of the call and how "
-    "the user wants to answer (their background, tone, role). When present, follow "
-    "it closely so the answer is specific to the user, not generic.\n"
-    "Rules:\n"
-    "- ALWAYS reply in English, no matter what.\n"
-    "- Lead with the answer. Be direct and concise.\n"
-    "- Use short paragraphs or bullet points; this is read at a glance.\n"
-    "- If the transcription is not actually a question or seems cut off, say so "
-    "in one line instead of inventing an answer."
+from src.prompting import (
+    ANSWER_LANGUAGE_RULES,
+    BASE_PROMPT,
+    LENGTH_DIRECTIVES,
+    compose_system_instruction,
 )
 
-# Extra instruction appended per answer-length preference chosen in the UI.
-LENGTH_DIRECTIVES = {
-    "short": (
-        "\n- LENGTH: keep it very brief — 1-2 sentences or a few short bullets. "
-        "Give only what the user needs to say out loud, no preamble."
-    ),
-    "detailed": (
-        "\n- LENGTH: give a thorough answer with the key supporting points, "
-        "still structured to read at a glance."
-    ),
-}
+# Re-exported so brain.py:_test() below and any README references keep
+# working. The actual strings/composition logic now live in src/prompting.py,
+# which has ZERO imports and is testable without google.genai installed.
+# This reproduces v1.0.0's SYSTEM_PROMPT exactly: base prompt + English rule.
+SYSTEM_PROMPT = BASE_PROMPT.format(answer_language_rule=ANSWER_LANGUAGE_RULES["en"])
 
 
 class Brain:
@@ -52,7 +37,9 @@ class Brain:
         # and only an attribute lookup like this one picks that update up.
         self.client = genai.Client(api_key=config.GEMINI_API_KEY)
         self.history: list[types.Content] = []  # rolling user/model turns
-        self._context = ""  # static meeting briefing for this session
+        self._context = ""  # per-call briefing typed into the composer box
+        self._preset_context = ""  # reusable role prompt carried by the active preset
+        self._answer_language = "en"  # active preset's answer language
         self._length = "short"  # answer-length preference: "short" | "detailed"
 
     def set_length(self, length: str) -> None:
@@ -66,18 +53,29 @@ class Brain:
         self._context = context.strip()
 
     def set_context(self, context: str) -> None:
-        """Update the meeting briefing WITHOUT clearing memory (pause/resume)."""
+        """Update the per-call briefing WITHOUT clearing memory (pause/resume).
+
+        This is the free-text composer box, distinct from a preset's own
+        context (set via set_preset) — both land in the same MEETING CONTEXT
+        block of the composed prompt.
+        """
         self._context = context.strip()
+
+    def set_preset(self, preset_context: str, answer_language: str) -> None:
+        """Apply the active preset's role prompt and answer language.
+
+        Called once per listening session, before the loop starts (mirrors
+        v1.0.0's set_context call at the top of CopilotWorker.run()).
+        """
+        self._preset_context = preset_context.strip()
+        self._answer_language = answer_language
 
     def _make_config(self) -> types.GenerateContentConfig:
         # The static meeting briefing rides in the system instruction (sent every
         # turn) instead of the history, so it never gets trimmed away.
-        system = SYSTEM_PROMPT + LENGTH_DIRECTIVES.get(self._length, "")
-        if self._context:
-            system += (
-                "\n\nMEETING CONTEXT (the topic and how the user wants to answer):\n"
-                f"{self._context}"
-            )
+        system = compose_system_instruction(
+            self._preset_context, self._context, self._answer_language, self._length
+        )
         return types.GenerateContentConfig(
             system_instruction=system,
             temperature=0.5,

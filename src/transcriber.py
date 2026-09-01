@@ -19,6 +19,7 @@ class Transcriber:
     ) -> None:
         self.language = language
         self.last_language: str = ""  # language detected on the last transcription
+        self.last_language_probability: float = 0.0  # confidence of that detection
         self.model, self.device, self.compute_type = self._load_model(model_size)
 
     def _load_model(self, model_size: str) -> tuple[WhisperModel, str, str]:
@@ -43,6 +44,7 @@ class Transcriber:
         )
         text = " ".join(seg.text.strip() for seg in segments).strip()
         self.last_language = getattr(info, "language", "") or ""
+        self.last_language_probability = float(getattr(info, "language_probability", 0.0) or 0.0)
         return text
 
 

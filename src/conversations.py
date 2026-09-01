@@ -28,6 +28,8 @@ class Conversation:
     exchanges: list[dict] = field(default_factory=list)
     # Set by the user; empty means "derive it from the first question".
     custom_title: str = ""
+    mode: str = "assistant"  # "assistant" | "translator"
+    preset_id: str = ""  # "" for Translator sessions and pre-multi-mode files
 
     @property
     def title(self) -> str:
@@ -117,6 +119,8 @@ def load(conv_id: str) -> Conversation | None:
             context=raw.get("context", ""),
             exchanges=raw.get("exchanges", []),
             custom_title=raw.get("custom_title", ""),
+            mode=raw.get("mode", "assistant"),
+            preset_id=raw.get("preset_id", ""),
         )
     except (OSError, ValueError, KeyError):
         return None
