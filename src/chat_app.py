@@ -55,7 +55,7 @@ from PySide6.QtWidgets import (
 )
 
 from src import config, conversations, settings, theme
-from src.audio_capture import list_loopback_devices
+from src.audio_source import list_devices
 from src.brain import Brain
 from src.config import (
     HIDE_FROM_SCREENSHARE,
@@ -1262,7 +1262,7 @@ class ChatWindow(QWidget):
     def _populate_devices(self) -> None:
         self.device_combo.clear()
         try:
-            devices = list_loopback_devices()
+            devices = list_devices()
         except Exception as exc:  # noqa: BLE001
             self.device_combo.addItem(f"(sin dispositivos: {exc})", None)
             return

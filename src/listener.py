@@ -11,7 +11,8 @@ from typing import Callable, Iterator
 import numpy as np
 import webrtcvad
 
-from src.audio_capture import SystemAudioCapture
+from src import audio_source
+from src.audio_source import SystemAudioSource
 from src.config import (
     FRAME_MS,
     MAX_UTTERANCE_S,
@@ -55,10 +56,16 @@ class Listener:
         aggressiveness: int = 2,  # 0..3, higher = filters more non-speech
         min_speech_ms: int = 400,  # ignore blips shorter than this
         device_index: int | None = None,  # which loopback device to capture
+        open_source: Callable[[int | None], SystemAudioSource] = audio_source.open_source,
     ) -> None:
         self.vad = webrtcvad.Vad(aggressiveness)
         self.transcriber = transcriber
         self.device_index = device_index
+        # Injected factory, not an instance: each capture method builds a fresh
+        # source and stop()s it in `finally`, so the source is per-RUN. A single
+        # injected instance couldn't be restarted across two listen() calls
+        # without inventing lifecycle rules that don't exist today.
+        self._open_source = open_source
         self.frame_size = int(SAMPLE_RATE * FRAME_MS / 1000)  # samples per VAD frame
         self.silence_frames_needed = SILENCE_MS_TO_ENDPOINT // FRAME_MS
         self.min_speech_frames = min_speech_ms // FRAME_MS
@@ -124,7 +131,7 @@ class Listener:
             if on_state is not None:
                 on_state(value)
 
-        cap = SystemAudioCapture(device_index=self.device_index)
+        cap = self._open_source(self.device_index)
         cap.start()
         self.running = True
         self.cancelled = False
@@ -199,7 +206,7 @@ class Listener:
             if on_state is not None:
                 on_state(value)
 
-        cap = SystemAudioCapture(device_index=self.device_index)
+        cap = self._open_source(self.device_index)
         cap.start()
         self.running = True
         self.cancelled = False
